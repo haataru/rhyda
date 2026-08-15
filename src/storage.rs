@@ -1,23 +1,51 @@
 use crate::cql_value::Value;
 use crate::schema::{ColumnDef, ColumnType, KeyspaceDef, TableDef};
 use anyhow::Result;
-use rocksdb::{DB, Direction, IteratorMode};
+use cql3_parser::cassandra_statement::CassandraStatement;
+use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 
 const KS_PREFIX: &[u8] = b"ks!";
 const TB_PREFIX: &[u8] = b"tb!";
 const DT_PREFIX: &[u8] = b"dt!";
 
-/// Storage layer: a thin wrapper around RocksDB.
-///
-/// Layout:
-/// - `ks!<keyspace>`                          -> serialized KeyspaceDef
-/// - `tb!<keyspace>!<table>`                  -> serialized TableDef
-/// - `dt!<keyspace>!<table>!<encoded row key>` -> encoded row columns
+const AST_CACHE_CAPACITY: usize = 8192;
+
+const MAX_BATCH_OPS: usize = 512;
+
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+
+enum WriteOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
 pub struct Storage {
-    db: DB,
-    write_sync: bool,
+    db: Arc<DB>,
+    keyspaces: RwLock<HashMap<String, KeyspaceDef>>,
+    tables: RwLock<HashMap<(String, String), TableDef>>,
+    ast_cache: Mutex<HashMap<String, Arc<CassandraStatement>>>,
+    ops_tx: Sender<WriteOp>,
+    sent_seq: Arc<AtomicU64>,
+    flushed: Arc<(Mutex<u64>, Condvar)>,
+}
+
+fn batch_apply(batch: &mut WriteBatch, op: WriteOp) {
+    match op {
+        WriteOp::Put(k, v) => {
+            batch.put(&k, &v);
+        }
+        WriteOp::Delete(k) => {
+            batch.delete(&k);
+        }
+    }
 }
 
 impl Storage {
@@ -25,16 +53,50 @@ impl Storage {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let db = DB::open(&opts, path)?;
+        let db = Arc::new(DB::open(&opts, path)?);
         let write_sync = std::env::var("RHYDADB_SYNC").is_ok();
-        let storage = Self { db, write_sync };
+        let writer_db = db.clone();
+        let (ops_tx, ops_rx) = channel::<WriteOp>();
+        let sent_seq = Arc::new(AtomicU64::new(0));
+        let flushed = Arc::new((Mutex::new(0u64), Condvar::new()));
+        {
+            let flushed = flushed.clone();
+            let mut wopts = WriteOptions::default();
+            if write_sync {
+                wopts.set_sync(true);
+            }
+            thread::Builder::new()
+                .name("rhydadb-writer".to_string())
+                .spawn(move || writer_loop(writer_db, ops_rx, flushed, wopts))?;
+        }
+        let storage = Self {
+            db,
+            keyspaces: RwLock::new(HashMap::new()),
+            tables: RwLock::new(HashMap::new()),
+            ast_cache: Mutex::new(HashMap::new()),
+            ops_tx,
+            sent_seq,
+            flushed,
+        };
         storage.seed_system()?;
         Ok(storage)
     }
 
-    /// Create the `system` keyspace with `system.local` and `system.peers`,
-    /// which real CQL drivers query on connect. Runs once; later starts reuse
-    /// the already-seeded tables.
+    fn flush(&self) {
+        let sent = self.sent_seq.load(Ordering::SeqCst);
+        if sent == 0 {
+            return;
+        }
+        let (lock, cv) = &*self.flushed;
+        let mut flushed = lock.lock().expect("flush lock poisoned");
+        while *flushed < sent {
+            let (guard, _) = cv
+                .wait_timeout(flushed, FLUSH_TIMEOUT)
+                .expect("flush condvar poisoned");
+            flushed = guard;
+        }
+    }
+
     fn seed_system(&self) -> Result<()> {
         if self.get_keyspace("system")?.is_some() {
             return Ok(());
@@ -84,14 +146,25 @@ impl Storage {
             (7u16, Value::Uuid(*host_id.as_bytes())),
             (8u16, Value::Inet(localhost)),
             (9u16, Value::Text("4".to_string())),
-            (10u16, Value::Text("org.apache.cassandra.dht.Murmur3Partitioner".to_string())),
+            (
+                10u16,
+                Value::Text("org.apache.cassandra.dht.Murmur3Partitioner".to_string()),
+            ),
             (11u16, Value::Text("rack1".to_string())),
             (12u16, Value::Text("4.0.7".to_string())),
             (13u16, Value::Inet(localhost)),
             (14u16, Value::Uuid(*schema_version.as_bytes())),
-            (15u16, Value::Set(vec![Value::Text("-9223372036854775808".to_string())])),
+            (
+                15u16,
+                Value::Set(vec![Value::Text("-9223372036854775808".to_string())]),
+            ),
         ];
-        self.put_row("system", "local", &[b"local".to_vec()], &encode_row_columns(&row))?;
+        self.put_row(
+            "system",
+            "local",
+            &[b"local".to_vec()],
+            &encode_row_columns(&row),
+        )?;
 
         let peers_def = TableDef {
             keyspace: "system".to_string(),
@@ -112,8 +185,6 @@ impl Storage {
         };
         self.put_table(&peers_def)?;
 
-        // system_schema: real drivers query these tables on connect to build
-        // their schema metadata. They are populated from user DDL by query.rs.
         let text2 = ColumnType::Text;
         let set_text = ColumnType::Set(Box::new(text2.clone()));
         let list_text = ColumnType::List(Box::new(text2.clone()));
@@ -170,7 +241,11 @@ impl Storage {
                     col("position", ColumnType::Int, false),
                     col("type", text2.clone(), false),
                 ],
-                partition_keys: vec!["keyspace_name".to_string(), "table_name".to_string(), "column_name".to_string()],
+                partition_keys: vec![
+                    "keyspace_name".to_string(),
+                    "table_name".to_string(),
+                    "column_name".to_string(),
+                ],
                 clustering_keys: vec![],
             },
             TableDef {
@@ -183,7 +258,11 @@ impl Storage {
                     col("kind", text2.clone(), false),
                     col("options", text2.clone(), false),
                 ],
-                partition_keys: vec!["keyspace_name".to_string(), "table_name".to_string(), "index_name".to_string()],
+                partition_keys: vec![
+                    "keyspace_name".to_string(),
+                    "table_name".to_string(),
+                    "index_name".to_string(),
+                ],
                 clustering_keys: vec![],
             },
             TableDef {
@@ -299,27 +378,31 @@ impl Storage {
     }
 
     pub fn put(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        if self.write_sync {
-            let mut wopts = rocksdb::WriteOptions::default();
-            wopts.set_sync(true);
-            self.db.put_opt(key, val, &wopts)?;
-        } else {
-            self.db.put(key, val)?;
-        }
+        self.sent_seq.fetch_add(1, Ordering::SeqCst);
+        self.ops_tx
+            .send(WriteOp::Put(key.to_vec(), val.to_vec()))
+            .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
         Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.flush();
         Ok(self.db.get(key)?.map(|v| v.to_vec()))
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.db.delete(key)?;
+        self.sent_seq.fetch_add(1, Ordering::SeqCst);
+        self.ops_tx
+            .send(WriteOp::Delete(key.to_vec()))
+            .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
         Ok(())
     }
 
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let iter = self.db.iterator(IteratorMode::From(prefix, Direction::Forward));
+        self.flush();
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, Direction::Forward));
         let mut out = Vec::new();
         for item in iter {
             let (k, v) = item?;
@@ -338,17 +421,36 @@ impl Storage {
         Ok(())
     }
 
-    // ---- schema ----
-
     pub fn put_keyspace(&self, ks: &KeyspaceDef) -> Result<()> {
         let key = [KS_PREFIX, ks.name.as_bytes()].concat();
-        self.put(&key, &serde_json::to_vec(ks)?)
+        self.put(&key, &serde_json::to_vec(ks)?)?;
+        self.keyspaces
+            .write()
+            .expect("keyspace cache poisoned")
+            .insert(ks.name.clone(), ks.clone());
+        Ok(())
     }
 
     pub fn get_keyspace(&self, name: &str) -> Result<Option<KeyspaceDef>> {
+        if let Some(ks) = self
+            .keyspaces
+            .read()
+            .expect("keyspace cache poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(Some(ks));
+        }
         let key = [KS_PREFIX, name.as_bytes()].concat();
         match self.get(&key)? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(bytes) => {
+                let ks: KeyspaceDef = serde_json::from_slice(&bytes)?;
+                self.keyspaces
+                    .write()
+                    .expect("keyspace cache poisoned")
+                    .insert(name.to_string(), ks.clone());
+                Ok(Some(ks))
+            }
             None => Ok(None),
         }
     }
@@ -359,18 +461,54 @@ impl Storage {
         let tb_prefix = [TB_PREFIX, name.as_bytes(), b"!"].concat();
         self.delete_prefix(&tb_prefix)?;
         let dt_prefix = [DT_PREFIX, name.as_bytes(), b"!"].concat();
-        self.delete_prefix(&dt_prefix)
+        self.delete_prefix(&dt_prefix)?;
+        self.keyspaces
+            .write()
+            .expect("keyspace cache poisoned")
+            .remove(name);
+        self.tables
+            .write()
+            .expect("tables cache poisoned")
+            .retain(|(ks, _), _| ks != name);
+        Ok(())
     }
 
     pub fn put_table(&self, table: &TableDef) -> Result<()> {
-        let key = [TB_PREFIX, table.keyspace.as_bytes(), b"!", table.name.as_bytes()].concat();
-        self.put(&key, &serde_json::to_vec(table)?)
+        let key = [
+            TB_PREFIX,
+            table.keyspace.as_bytes(),
+            b"!",
+            table.name.as_bytes(),
+        ]
+        .concat();
+        self.put(&key, &serde_json::to_vec(table)?)?;
+        self.tables
+            .write()
+            .expect("tables cache poisoned")
+            .insert((table.keyspace.clone(), table.name.clone()), table.clone());
+        Ok(())
     }
 
     pub fn get_table(&self, keyspace: &str, table: &str) -> Result<Option<TableDef>> {
+        if let Some(def) = self
+            .tables
+            .read()
+            .expect("tables cache poisoned")
+            .get(&(keyspace.to_string(), table.to_string()))
+            .cloned()
+        {
+            return Ok(Some(def));
+        }
         let key = [TB_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes()].concat();
         match self.get(&key)? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(bytes) => {
+                let def: TableDef = serde_json::from_slice(&bytes)?;
+                self.tables
+                    .write()
+                    .expect("tables cache poisoned")
+                    .insert((keyspace.to_string(), table.to_string()), def.clone());
+                Ok(Some(def))
+            }
             None => Ok(None),
         }
     }
@@ -379,7 +517,12 @@ impl Storage {
         let tb_key = [TB_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes()].concat();
         self.delete(&tb_key)?;
         let dt_prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
-        self.delete_prefix(&dt_prefix)
+        self.delete_prefix(&dt_prefix)?;
+        self.tables
+            .write()
+            .expect("tables cache poisoned")
+            .remove(&(keyspace.to_string(), table.to_string()));
+        Ok(())
     }
 
     pub fn truncate_table(&self, keyspace: &str, table: &str) -> Result<()> {
@@ -387,19 +530,44 @@ impl Storage {
         self.delete_prefix(&dt_prefix)
     }
 
-    // ---- data ----
+    pub fn ast_cache_get(&self, query: &str) -> Option<Arc<CassandraStatement>> {
+        self.ast_cache
+            .lock()
+            .expect("ast cache poisoned")
+            .get(query)
+            .cloned()
+    }
+
+    pub fn ast_cache_put(&self, query: &str, stmt: Arc<CassandraStatement>) {
+        let mut cache = self.ast_cache.lock().expect("ast cache poisoned");
+        if cache.len() >= AST_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(query.to_string(), stmt);
+    }
 
     fn data_prefix(&self, keyspace: &str, table: &str) -> Vec<u8> {
         [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat()
     }
 
-    pub fn get_row(&self, keyspace: &str, table: &str, key_parts: &[Vec<u8>]) -> Result<Option<Vec<u8>>> {
+    pub fn get_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+    ) -> Result<Option<Vec<u8>>> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
         Ok(self.get(&key)?.map(|v| v.to_vec()))
     }
 
-    pub fn put_row(&self, keyspace: &str, table: &str, key_parts: &[Vec<u8>], value: &[u8]) -> Result<()> {
+    pub fn put_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+        value: &[u8],
+    ) -> Result<()> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
         self.put(&key, value)
@@ -411,14 +579,16 @@ impl Storage {
         self.delete(&key)
     }
 
-    /// Scan all rows of a table. Returns full keys (including the table prefix)
-    /// and raw row values.
     pub fn scan_rows(&self, keyspace: &str, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix(&self.data_prefix(keyspace, table))
     }
 
-    /// Scan rows of a single partition (prefix on the partition key parts).
-    pub fn scan_partition(&self, keyspace: &str, table: &str, partition_key: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_partition(
+        &self,
+        keyspace: &str,
+        table: &str,
+        partition_key: &[Vec<u8>],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut prefix = self.data_prefix(keyspace, table);
         prefix.extend(encode_key(partition_key));
         self.scan_prefix(&prefix)
@@ -434,9 +604,42 @@ fn col(name: &str, col_type: ColumnType, is_partition_key: bool) -> ColumnDef {
     }
 }
 
-/// Encode key parts into a single sortable byte string.
-/// Each part is prefixed with a big-endian u16 length, so lexicographic
-/// ordering of the result matches the (part1, part2, ...) ordering.
+fn writer_loop(
+    db: Arc<DB>,
+    ops_rx: Receiver<WriteOp>,
+    flushed: Arc<(Mutex<u64>, Condvar)>,
+    wopts: WriteOptions,
+) {
+    let mut seq = 0u64;
+    loop {
+        let first = match ops_rx.recv() {
+            Ok(op) => op,
+            Err(_) => {
+                return;
+            }
+        };
+        let mut batch = WriteBatch::default();
+        batch_apply(&mut batch, first);
+        let mut n = 1usize;
+        while n < MAX_BATCH_OPS {
+            match ops_rx.try_recv() {
+                Ok(op) => {
+                    batch_apply(&mut batch, op);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = db.write_opt(batch, &wopts) {
+            eprintln!("storage writer: write batch failed: {e}");
+        }
+        seq += n as u64;
+        let (lock, cv) = &*flushed;
+        *lock.lock().expect("flush lock poisoned") = seq;
+        cv.notify_all();
+    }
+}
+
 pub fn encode_key(parts: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in parts {
@@ -446,7 +649,6 @@ pub fn encode_key(parts: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// Decode key parts from a full data key (with table prefix).
 pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Vec<u8>>> {
     let prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
     if !full_key.starts_with(&prefix) {
@@ -468,7 +670,6 @@ pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Ve
     Ok(parts)
 }
 
-/// Encode a set of (column index, value) pairs into a row value.
 pub fn encode_row_columns(values: &[(u16, Value)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (idx, v) in values {
@@ -478,8 +679,6 @@ pub fn encode_row_columns(values: &[(u16, Value)]) -> Vec<u8> {
     out
 }
 
-/// Decode a row value into values aligned with the table's column order.
-/// Missing columns become Null.
 pub fn decode_row_columns(data: &[u8], table: &TableDef) -> Result<Vec<Value>> {
     let mut out: Vec<Value> = vec![Value::Null; table.columns.len()];
     let mut off = 0usize;

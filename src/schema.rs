@@ -1,7 +1,6 @@
 use cql3_parser::common::{DataTypeName, Identifier};
 use serde::{Deserialize, Serialize};
 
-/// The column types supported by RhydaDB (a subset of CQL types).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
     Int,
@@ -22,8 +21,6 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    /// The CQL binary protocol type id, as used in result metadata
-    /// (for collections this is the collection id, element types follow).
     pub fn wire_id(&self) -> u16 {
         match self {
             ColumnType::Int => 0x0009,
@@ -44,7 +41,6 @@ impl ColumnType {
         }
     }
 
-    /// Write the full type description to the wire (collection element types follow the id).
     pub fn write_wire_type(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.wire_id().to_be_bytes());
         match self {
@@ -59,7 +55,6 @@ impl ColumnType {
         }
     }
 
-    /// The CQL type name, as used in system_schema columns.
     pub fn cql_string(&self) -> String {
         match self {
             ColumnType::Int => "int".to_string(),
@@ -89,7 +84,9 @@ impl ColumnType {
             DataTypeName::Float => Some(ColumnType::Float),
             DataTypeName::Double => Some(ColumnType::Double),
             DataTypeName::Boolean => Some(ColumnType::Boolean),
-            DataTypeName::Text | DataTypeName::VarChar | DataTypeName::Ascii => Some(ColumnType::Text),
+            DataTypeName::Text | DataTypeName::VarChar | DataTypeName::Ascii => {
+                Some(ColumnType::Text)
+            }
             DataTypeName::Blob => Some(ColumnType::Blob),
             DataTypeName::Timestamp => Some(ColumnType::Timestamp),
             DataTypeName::Uuid | DataTypeName::TimeUuid => Some(ColumnType::Uuid),
@@ -99,18 +96,17 @@ impl ColumnType {
                 match name {
                     DataTypeName::Set => Some(ColumnType::Set(Box::new(elem(0)?))),
                     DataTypeName::List => Some(ColumnType::List(Box::new(elem(0)?))),
-                    DataTypeName::Map => Some(ColumnType::Map(Box::new(elem(0)?), Box::new(elem(1)?))),
+                    DataTypeName::Map => {
+                        Some(ColumnType::Map(Box::new(elem(0)?), Box::new(elem(1)?)))
+                    }
                     DataTypeName::Frozen => {
-                        // frozen<X> is a no-op for us; unwrap the first inner type.
                         let inner = definition.first()?;
                         match inner {
-                            DataTypeName::Set => {
-                                Some(ColumnType::Set(Box::new(elem(1)?)))
+                            DataTypeName::Set => Some(ColumnType::Set(Box::new(elem(1)?))),
+                            DataTypeName::List => Some(ColumnType::List(Box::new(elem(1)?))),
+                            DataTypeName::Map => {
+                                Some(ColumnType::Map(Box::new(elem(1)?), Box::new(elem(2)?)))
                             }
-                            DataTypeName::List => {
-                                Some(ColumnType::List(Box::new(elem(1)?)))
-                            }
-                            DataTypeName::Map => Some(ColumnType::Map(Box::new(elem(1)?), Box::new(elem(2)?))),
                             other => ColumnType::from_data_type(other, &[]),
                         }
                     }
@@ -122,7 +118,6 @@ impl ColumnType {
     }
 }
 
-/// Definition of a single table column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
@@ -131,7 +126,6 @@ pub struct ColumnDef {
     pub is_clustering: bool,
 }
 
-/// Schema definition of a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub keyspace: String,
@@ -150,21 +144,17 @@ impl TableDef {
         self.partition_keys.iter().any(|p| p == name)
     }
 
-    /// Index of a column within the table definition.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
     }
 }
 
-/// Schema definition of a keyspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyspaceDef {
     pub name: String,
     pub replication: Vec<(String, String)>,
 }
 
-/// Normalize a CQL identifier: unquoted identifiers are case-insensitive (lowercased),
-/// quoted identifiers keep their exact case.
 pub fn norm_id(id: &Identifier) -> String {
     match id {
         Identifier::Quoted(s) => s.clone(),
@@ -172,9 +162,11 @@ pub fn norm_id(id: &Identifier) -> String {
     }
 }
 
-/// Build a `TableDef` from a parsed CREATE TABLE statement.
-/// Returns `None` if the table uses unsupported column types.
-pub fn build_table_def(keyspace: &str, table_name: &str, create: &cql3_parser::create_table::CreateTable) -> Option<TableDef> {
+pub fn build_table_def(
+    keyspace: &str,
+    table_name: &str,
+    create: &cql3_parser::create_table::CreateTable,
+) -> Option<TableDef> {
     let mut partition_keys: Vec<String> = Vec::new();
     let mut clustering_keys: Vec<String> = Vec::new();
     if let Some(key) = &create.key {

@@ -1,7 +1,6 @@
 use crate::schema::ColumnType;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
-/// A CQL value as stored and returned by the database.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -23,7 +22,6 @@ pub enum Value {
 }
 
 impl Value {
-    /// CQL wire format for a value: [int32] length + raw bytes; -1 means null.
     pub fn to_wire(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
@@ -39,7 +37,6 @@ impl Value {
         out
     }
 
-    /// Raw bytes of a non-null value (no length prefix).
     pub fn raw_bytes(&self) -> Vec<u8> {
         match self {
             Value::Null => Vec::new(),
@@ -86,7 +83,6 @@ impl Value {
         }
     }
 
-    /// Decode raw bytes (no length prefix) into a typed value.
     pub fn from_raw_bytes(raw: &[u8], col_type: &ColumnType) -> Result<Value> {
         let mut wire = Vec::with_capacity(4 + raw.len());
         wire.extend_from_slice(&(raw.len() as i32).to_be_bytes());
@@ -94,7 +90,6 @@ impl Value {
         Value::from_wire(&wire, col_type)
     }
 
-    /// Decode a wire-encoded value ([int32] length prefix + bytes) into a typed value.
     pub fn from_wire(data: &[u8], col_type: &ColumnType) -> Result<Value> {
         if data.len() < 4 {
             return Err(anyhow!("value is shorter than its length prefix"));
@@ -122,7 +117,9 @@ impl Value {
             ColumnType::Uuid => Value::Uuid(raw.try_into()?),
             ColumnType::Inet => {
                 let v = match raw.len() {
-                    4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
+                    4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        raw[0], raw[1], raw[2], raw[3],
+                    )),
                     16 => {
                         let mut octets = [0u8; 16];
                         octets.copy_from_slice(raw);
@@ -146,7 +143,8 @@ impl Value {
                     if off + 4 > raw.len() {
                         return Err(anyhow!("set value truncated"));
                     }
-                    let elen = i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    let elen =
+                        i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                     if elen < 0 || off + 4 + elen as usize > raw.len() {
                         return Err(anyhow!("set value truncated"));
                     }
@@ -171,7 +169,8 @@ impl Value {
                     if off + 4 > raw.len() {
                         return Err(anyhow!("list value truncated"));
                     }
-                    let elen = i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    let elen =
+                        i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                     if elen < 0 || off + 4 + elen as usize > raw.len() {
                         return Err(anyhow!("list value truncated"));
                     }
@@ -196,7 +195,8 @@ impl Value {
                     if off + 4 > raw.len() {
                         return Err(anyhow!("map value truncated"));
                     }
-                    let klen = i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    let klen =
+                        i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                     if klen < 0 || off + 4 + klen as usize > raw.len() {
                         return Err(anyhow!("map value truncated"));
                     }
@@ -206,7 +206,8 @@ impl Value {
                     if off + 4 > raw.len() {
                         return Err(anyhow!("map value truncated"));
                     }
-                    let vlen = i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                    let vlen =
+                        i32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                     if vlen < 0 || off + 4 + vlen as usize > raw.len() {
                         return Err(anyhow!("map value truncated"));
                     }
@@ -221,7 +222,6 @@ impl Value {
         Ok(v)
     }
 
-    /// Parse a CQL literal (raw text as it appears in the query) into a typed value.
     pub fn parse_literal(text: &str, col_type: &ColumnType) -> Result<Value> {
         let t = text.trim();
         match col_type {
@@ -260,7 +260,8 @@ impl Value {
                     .strip_prefix("0x")
                     .or_else(|| t.strip_prefix("0X"))
                     .unwrap_or(t);
-                let bytes = hex::decode(hex_text).map_err(|_| anyhow!("cannot parse '{text}' as blob"))?;
+                let bytes =
+                    hex::decode(hex_text).map_err(|_| anyhow!("cannot parse '{text}' as blob"))?;
                 Ok(Value::Blob(bytes))
             }
             ColumnType::Timestamp => t
@@ -289,7 +290,6 @@ impl Value {
     }
 }
 
-/// Strip surrounding single quotes and unescape doubled quotes, per CQL string literal rules.
 pub fn unescape_string(text: &str) -> String {
     let t = text.trim();
     if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {

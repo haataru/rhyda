@@ -1,10 +1,10 @@
 use rhydadb::server;
 use rhydadb::storage::Storage;
-use scylla_cql::frame::request::query::{PagingState, Query, QueryParameters};
-use scylla_cql::frame::request::{Startup, Options};
-use scylla_cql::frame::SerializedRequest;
-use scylla_cql::serialize::row::SerializedValues;
 use scylla_cql::Consistency;
+use scylla_cql::frame::SerializedRequest;
+use scylla_cql::frame::request::query::{PagingState, Query, QueryParameters};
+use scylla_cql::frame::request::{Options, Startup};
+use scylla_cql::serialize::row::SerializedValues;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +22,12 @@ const RESULT_SET_KEYSPACE: i32 = 3;
 const RESULT_SCHEMA_CHANGE: i32 = 5;
 
 async fn start_server() -> (std::net::SocketAddr, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("rhydadb-test-{}", std::process::id()));
+    let test_name = std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .replace("::", "-");
+    let dir =
+        std::env::temp_dir().join(format!("rhydadb-test-{}-{}", std::process::id(), test_name));
     let storage = Arc::new(Storage::open(&dir).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -106,7 +111,11 @@ fn read_short(cur: &mut &[u8]) -> u16 {
 
 fn read_string(cur: &mut &[u8]) -> String {
     let len = read_short(cur) as usize;
-    assert!(len <= cur.len(), "read_string: len={len} but only {} bytes left", cur.len());
+    assert!(
+        len <= cur.len(),
+        "read_string: len={len} but only {} bytes left",
+        cur.len()
+    );
     let (s, rest) = cur.split_at(len);
     *cur = rest;
     String::from_utf8(s.to_vec()).unwrap()
@@ -172,7 +181,9 @@ async fn full_cql_flow() {
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
 
-    let (op, body) = c.query("CREATE TABLE test.users (id int PRIMARY KEY, name text, age int)").await;
+    let (op, body) = c
+        .query("CREATE TABLE test.users (id int PRIMARY KEY, name text, age int)")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
 
@@ -180,11 +191,15 @@ async fn full_cql_flow() {
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_SET_KEYSPACE);
 
-    let (op, body) = c.query("INSERT INTO users (id, name, age) VALUES (1, 'alice', 30)").await;
+    let (op, body) = c
+        .query("INSERT INTO users (id, name, age) VALUES (1, 'alice', 30)")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_VOID);
 
-    let (op, body) = c.query("INSERT INTO users (id, name, age) VALUES (2, 'bob', 25)").await;
+    let (op, body) = c
+        .query("INSERT INTO users (id, name, age) VALUES (2, 'bob', 25)")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_VOID);
 
@@ -220,15 +235,23 @@ async fn full_cql_flow() {
     assert_eq!(res.rows[0][0], Some(1i32.to_be_bytes().to_vec()));
     assert_eq!(res.rows[1][0], Some(2i32.to_be_bytes().to_vec()));
 
-    let (op, body) = c.query("CREATE TABLE sensor (device text, ts bigint, temp double, PRIMARY KEY (device, ts))").await;
+    let (op, body) = c
+        .query(
+            "CREATE TABLE sensor (device text, ts bigint, temp double, PRIMARY KEY (device, ts))",
+        )
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
 
-    let (op, body) = c.query("INSERT INTO sensor (device, ts, temp) VALUES ('a', 100, 36.6)").await;
+    let (op, body) = c
+        .query("INSERT INTO sensor (device, ts, temp) VALUES ('a', 100, 36.6)")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_VOID);
 
-    let (op, body) = c.query("INSERT INTO sensor (device, ts, temp) VALUES ('a', 200, 37.0)").await;
+    let (op, body) = c
+        .query("INSERT INTO sensor (device, ts, temp) VALUES ('a', 200, 37.0)")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     assert_eq!(parse_result(&body).0, RESULT_VOID);
 
@@ -245,7 +268,9 @@ async fn full_cql_flow() {
     assert_eq!(res.rows[1][1], Some(200i64.to_be_bytes().to_vec()));
     assert_eq!(res.rows[1][2], Some(37.0f64.to_be_bytes().to_vec()));
 
-    let (op, body) = c.query("SELECT * FROM sensor WHERE device = 'a' AND ts = 200").await;
+    let (op, body) = c
+        .query("SELECT * FROM sensor WHERE device = 'a' AND ts = 200")
+        .await;
     assert_eq!(op, OPCODE_RESULT);
     let (kind, res) = parse_result(&body);
     assert_eq!(kind, RESULT_ROWS);
@@ -286,6 +311,298 @@ async fn full_cql_flow() {
     assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
 
     let (op, body) = c.query("SELECT * FROM users").await;
+    assert_eq!(op, OPCODE_ERROR);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 0x2200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn read_short_bytes(cur: &mut &[u8]) -> Vec<u8> {
+    let len = read_short(cur) as usize;
+    let (b, rest) = cur.split_at(len);
+    *cur = rest;
+    b.to_vec()
+}
+
+fn long_string(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+fn wire_value(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(raw.len() as i32).to_be_bytes());
+    out.extend_from_slice(raw);
+    out
+}
+
+fn wire_set_text(items: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(items.len() as i32).to_be_bytes());
+    for it in items {
+        out.extend(wire_value(it.as_bytes()));
+    }
+    out
+}
+
+fn execute_body(id: &[u8], values: &[Vec<u8>], skip_metadata: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    out.extend_from_slice(id);
+    out.extend_from_slice(&0x0001u16.to_be_bytes());
+    out.push(0x01 | if skip_metadata { 0x02 } else { 0 });
+    out.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for v in values {
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+fn query_body(query: &str, values: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = long_string(query);
+    out.extend_from_slice(&0x0001u16.to_be_bytes());
+    out.push(0x01);
+    out.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for v in values {
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+impl Client {
+    async fn raw_request(&mut self, opcode: u8, body: &[u8]) -> (u8, Vec<u8>) {
+        let mut frame = Vec::with_capacity(9 + body.len());
+        frame.push(0x04);
+        frame.push(0x00);
+        frame.extend_from_slice(&0i16.to_be_bytes());
+        frame.push(opcode);
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        self.send_frame(&frame).await;
+        self.read_frame().await
+    }
+}
+
+#[tokio::test]
+async fn prepared_statements() {
+    let (addr, dir) = start_server().await;
+    let mut c = Client::connect(addr).await;
+
+    let (op, _) = c.startup().await;
+    assert_eq!(op, OPCODE_READY);
+
+    let (op, body) = c
+        .query("CREATE KEYSPACE prep WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}")
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
+
+    let (op, body) = c
+        .query("CREATE TABLE prep.t (id int PRIMARY KEY, name text, tags set<text>)")
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    assert_eq!(parse_result(&body).0, RESULT_SCHEMA_CHANGE);
+
+    let (op, _) = c.query("USE prep").await;
+    assert_eq!(op, OPCODE_RESULT);
+
+    let (op, body) = c
+        .raw_request(
+            0x09,
+            &long_string("INSERT INTO t (id, name, tags) VALUES (?, ?, ?)"),
+        )
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 4);
+    let id = read_short_bytes(&mut cur);
+    assert_eq!(id.len(), 2);
+    let _bind_flags = read_i32(&mut cur);
+    assert_eq!(read_i32(&mut cur), 3);
+    assert_eq!(read_i32(&mut cur), 1);
+    assert_eq!(read_short(&mut cur), 0);
+    assert_eq!(read_string(&mut cur), "prep");
+    assert_eq!(read_string(&mut cur), "t");
+    let name = read_string(&mut cur);
+    assert_eq!(name, "id");
+    assert_eq!(read_short(&mut cur), 0x0009);
+    let name = read_string(&mut cur);
+    assert_eq!(name, "name");
+    assert_eq!(read_short(&mut cur), 0x000D);
+    let name = read_string(&mut cur);
+    assert_eq!(name, "tags");
+    assert_eq!(read_short(&mut cur), 0x0022);
+    assert_eq!(read_short(&mut cur), 0x000D);
+    let _result_flags = read_i32(&mut cur);
+    assert_eq!(read_i32(&mut cur), 0);
+    assert_eq!(read_string(&mut cur), "prep");
+    assert_eq!(read_string(&mut cur), "t");
+    assert!(cur.is_empty());
+
+    let exec = execute_body(
+        &id,
+        &[
+            wire_value(&1i32.to_be_bytes()),
+            wire_value(b"alice"),
+            wire_value(&wire_set_text(&["x", "y"])),
+        ],
+        false,
+    );
+    let (op, body) = c.raw_request(0x0A, &exec).await;
+    if op != OPCODE_RESULT {
+        let mut cur = &body[..];
+        eprintln!(
+            "EXECUTE error code={:#x} msg={:?}",
+            read_i32(&mut cur),
+            String::from_utf8_lossy(cur)
+        );
+    }
+    assert_eq!(op, OPCODE_RESULT);
+    assert_eq!(parse_result(&body).0, RESULT_VOID);
+
+    let (op, body) = c
+        .raw_request(0x09, &long_string("SELECT * FROM t WHERE id = ?"))
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 4);
+    let sel_id = read_short_bytes(&mut cur);
+    let _bind_flags = read_i32(&mut cur);
+    assert_eq!(read_i32(&mut cur), 1);
+    assert_eq!(read_i32(&mut cur), 0);
+    let ks = read_string(&mut cur);
+    if ks != "prep" {
+        eprintln!("SELECT PREPARE body: {:02x?}", body);
+        eprintln!("ks={ks:?}, rest={:02x?}", cur);
+    }
+    assert_eq!(ks, "prep");
+    assert_eq!(read_string(&mut cur), "t");
+    assert_eq!(read_string(&mut cur), "id");
+    assert_eq!(read_short(&mut cur), 0x0009);
+    let _result_flags = read_i32(&mut cur);
+    assert_eq!(read_i32(&mut cur), 3);
+    assert_eq!(read_string(&mut cur), "prep");
+    assert_eq!(read_string(&mut cur), "t");
+    assert_eq!(read_string(&mut cur), "id");
+    assert_eq!(read_short(&mut cur), 0x0009);
+    assert_eq!(read_string(&mut cur), "name");
+    assert_eq!(read_short(&mut cur), 0x000D);
+    assert_eq!(read_string(&mut cur), "tags");
+    assert_eq!(read_short(&mut cur), 0x0022);
+    assert_eq!(read_short(&mut cur), 0x000D);
+    assert!(cur.is_empty());
+
+    let exec = execute_body(&sel_id, &[wire_value(&1i32.to_be_bytes())], true);
+    let (op, body) = c.raw_request(0x0A, &exec).await;
+    assert_eq!(op, OPCODE_RESULT);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), RESULT_ROWS);
+    assert_eq!(read_i32(&mut cur), 0);
+    assert_eq!(read_i32(&mut cur), -1);
+    assert_eq!(read_i32(&mut cur), 1);
+    let id_raw = read_i32(&mut cur);
+    assert_eq!(id_raw, 4);
+    let (v, rest) = cur.split_at(4);
+    assert_eq!(v, 1i32.to_be_bytes());
+    cur = rest;
+    let name_len = read_i32(&mut cur);
+    assert_eq!(name_len, 5);
+    let (v, rest) = cur.split_at(5);
+    assert_eq!(v, b"alice");
+    cur = rest;
+    let tags_len = read_i32(&mut cur);
+    assert_eq!(tags_len as usize, wire_set_text(&["x", "y"]).len());
+    let (v, rest) = cur.split_at(tags_len as usize);
+    assert_eq!(v, wire_set_text(&["x", "y"]));
+    cur = rest;
+    assert!(cur.is_empty());
+
+    let (op, body) = c
+        .raw_request(0x09, &long_string("UPDATE t SET name = ? WHERE id = ?"))
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 4);
+    let upd_id = read_short_bytes(&mut cur);
+    let _f = read_i32(&mut cur);
+    assert_eq!(read_i32(&mut cur), 2);
+    assert_eq!(read_i32(&mut cur), 0);
+    assert_eq!(read_string(&mut cur), "prep");
+    assert_eq!(read_string(&mut cur), "t");
+    assert_eq!(read_string(&mut cur), "name");
+    assert_eq!(read_short(&mut cur), 0x000D);
+    assert_eq!(read_string(&mut cur), "id");
+    assert_eq!(read_short(&mut cur), 0x0009);
+    let (op, body) = c
+        .raw_request(
+            0x0A,
+            &execute_body(
+                &upd_id,
+                &[wire_value(b"bob"), wire_value(&2i32.to_be_bytes())],
+                false,
+            ),
+        )
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    assert_eq!(parse_result(&body).0, RESULT_VOID);
+    let (op, body) = c
+        .raw_request(0x09, &long_string("SELECT name FROM t WHERE id = ?"))
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 4);
+    let sel_name_id = read_short_bytes(&mut cur);
+    let (op, body) = c
+        .raw_request(
+            0x0A,
+            &execute_body(&sel_name_id, &[wire_value(&2i32.to_be_bytes())], false),
+        )
+        .await;
+    assert_eq!(op, OPCODE_RESULT);
+    let (kind, res) = parse_result(&body);
+    assert_eq!(kind, RESULT_ROWS);
+    let res = res.unwrap();
+    assert_eq!(res.names, vec!["name"]);
+    assert_eq!(res.rows[0][0], Some(b"bob".to_vec()));
+
+    let (op, body) = c
+        .raw_request(0x0A, &execute_body(&[0x00, 0xFF], &[], false))
+        .await;
+    assert_eq!(op, OPCODE_ERROR);
+    let mut cur = &body[..];
+    assert_eq!(read_i32(&mut cur), 0x2200);
+
+    let qv_ins = query_body(
+        "INSERT INTO t (id, name) VALUES (?, ?)",
+        &[wire_value(&3i32.to_be_bytes()), wire_value(b"carol")],
+    );
+    let (op, body) = c.raw_request(0x07, &qv_ins).await;
+    assert_eq!(op, OPCODE_RESULT);
+    assert_eq!(parse_result(&body).0, RESULT_VOID);
+    let qv_sel = query_body(
+        "SELECT name FROM t WHERE id = ?",
+        &[wire_value(&3i32.to_be_bytes())],
+    );
+    let (op, body) = c.raw_request(0x07, &qv_sel).await;
+    assert_eq!(op, OPCODE_RESULT);
+    let (kind, res) = parse_result(&body);
+    assert_eq!(kind, RESULT_ROWS);
+    let res = res.unwrap();
+    assert_eq!(res.names, vec!["name"]);
+    assert_eq!(res.rows[0][0], Some(b"carol".to_vec()));
+
+    let (op, body) = c
+        .raw_request(
+            0x07,
+            &query_body(
+                "INSERT INTO t (id, name) VALUES (?, ?)",
+                &[wire_value(&4i32.to_be_bytes())],
+            ),
+        )
+        .await;
     assert_eq!(op, OPCODE_ERROR);
     let mut cur = &body[..];
     assert_eq!(read_i32(&mut cur), 0x2200);

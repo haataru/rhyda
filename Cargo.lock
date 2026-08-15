@@ -950,8 +950,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-cql"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39fdf3275f199260fe55b903bac78e3d85a9c95c3a8432f044d81a2d5baab6d1"
 dependencies = [
  "cc",
  "regex",

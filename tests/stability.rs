@@ -1,10 +1,10 @@
 use rhydadb::server;
 use rhydadb::storage::Storage;
-use scylla_cql::frame::request::query::{PagingState, Query, QueryParameters};
-use scylla_cql::frame::request::Startup;
-use scylla_cql::frame::SerializedRequest;
-use scylla_cql::serialize::row::SerializedValues;
 use scylla_cql::Consistency;
+use scylla_cql::frame::SerializedRequest;
+use scylla_cql::frame::request::Startup;
+use scylla_cql::frame::request::query::{PagingState, Query, QueryParameters};
+use scylla_cql::serialize::row::SerializedValues;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +15,9 @@ const OPCODE_ERROR: u8 = 0x00;
 const OPCODE_READY: u8 = 0x02;
 const OPCODE_RESULT: u8 = 0x08;
 
-async fn start_server(dir: &std::path::Path) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_server(
+    dir: &std::path::Path,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let storage = Arc::new(Storage::open(dir).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -119,7 +121,14 @@ fn parse_result(body: &[u8]) -> (i32, Option<RowsResponse>) {
     (kind, Some(RowsResponse { names, rows }))
 }
 
-fn write_frame(_stream: &mut TcpStream, version: u8, flags: u8, stream_id: i16, opcode: u8, body: &[u8]) -> Vec<u8> {
+fn write_frame(
+    _stream: &mut TcpStream,
+    version: u8,
+    flags: u8,
+    stream_id: i16,
+    opcode: u8,
+    body: &[u8],
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(9 + body.len());
     frame.push(version);
     frame.push(flags);
@@ -138,7 +147,11 @@ async fn concurrent_hammer() {
     let mut setup = connect(addr).await;
     let (op, _) = query(&mut setup, "CREATE KEYSPACE hammer WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").await;
     assert_eq!(op, OPCODE_RESULT);
-    let (op, _) = query(&mut setup, "CREATE TABLE hammer.items (client int, idx int, val int, PRIMARY KEY (client, idx))").await;
+    let (op, _) = query(
+        &mut setup,
+        "CREATE TABLE hammer.items (client int, idx int, val int, PRIMARY KEY (client, idx))",
+    )
+    .await;
     assert_eq!(op, OPCODE_RESULT);
 
     let mut handles = Vec::new();
@@ -146,23 +159,44 @@ async fn concurrent_hammer() {
         handles.push(tokio::spawn(async move {
             let mut s = connect(addr).await;
             for i in 0..50 {
-                let (op, _) = query(&mut s, &format!("INSERT INTO hammer.items (client, idx, val) VALUES ({client}, {i}, {i})")).await;
-                assert_eq!(op, OPCODE_RESULT, "insert failed for client {client} idx {i}");
+                let (op, _) = query(
+                    &mut s,
+                    &format!(
+                        "INSERT INTO hammer.items (client, idx, val) VALUES ({client}, {i}, {i})"
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    op, OPCODE_RESULT,
+                    "insert failed for client {client} idx {i}"
+                );
             }
-            let (op, body) = query(&mut s, &format!("SELECT val FROM hammer.items WHERE client = {client}")).await;
+            let (op, body) = query(
+                &mut s,
+                &format!("SELECT val FROM hammer.items WHERE client = {client}"),
+            )
+            .await;
             assert_eq!(op, OPCODE_RESULT);
             let (kind, res) = parse_result(&body);
             assert_eq!(kind, 2);
             assert_eq!(res.unwrap().rows.len(), 50, "client {client} lost rows");
             for i in 0..50i32 {
-                let (op, body) = query(&mut s, &format!("SELECT val FROM hammer.items WHERE client = {client} AND idx = {i}")).await;
+                let (op, body) = query(
+                    &mut s,
+                    &format!("SELECT val FROM hammer.items WHERE client = {client} AND idx = {i}"),
+                )
+                .await;
                 assert_eq!(op, OPCODE_RESULT);
                 let (kind, res) = parse_result(&body);
                 assert_eq!(kind, 2);
                 let res = res.unwrap();
                 assert_eq!(res.names, vec!["val"], "client {client} idx {i}");
                 assert_eq!(res.rows.len(), 1, "client {client} idx {i}");
-                assert_eq!(res.rows[0][0], Some(i.to_be_bytes().to_vec()), "client {client} idx {i} wrong value");
+                assert_eq!(
+                    res.rows[0][0],
+                    Some(i.to_be_bytes().to_vec()),
+                    "client {client} idx {i} wrong value"
+                );
             }
         }));
     }
@@ -187,10 +221,13 @@ async fn garbage_frames_do_not_kill_server() {
     let (addr, _server_handle) = start_server(&dir).await;
 
     let mut c = connect(addr).await;
-    let (op, _) = query(&mut c, "CREATE KEYSPACE g WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").await;
+    let (op, _) = query(
+        &mut c,
+        "CREATE KEYSPACE g WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+    )
+    .await;
     assert_eq!(op, OPCODE_RESULT);
 
-    // Wrong protocol version -> protocol error and connection close.
     let mut v = connect(addr).await;
     let frame = write_frame(&mut v, 0x05, 0x00, 0, 0x07, &[]);
     v.write_all(&frame).await.unwrap();
@@ -200,7 +237,6 @@ async fn garbage_frames_do_not_kill_server() {
     assert_eq!(header[4], OPCODE_ERROR);
     drop(v);
 
-    // Huge declared length -> error frame, no allocation blowup.
     let mut v = connect(addr).await;
     let frame = write_frame(&mut v, 0x04, 0x00, 0, 0x07, &[]);
     let mut huge = frame.clone();
@@ -211,7 +247,6 @@ async fn garbage_frames_do_not_kill_server() {
     assert_eq!(header[4], OPCODE_ERROR);
     drop(v);
 
-    // Unknown opcode -> error frame.
     let mut v = connect(addr).await;
     let frame = write_frame(&mut v, 0x04, 0x00, 0, 0xFF, &[]);
     v.write_all(&frame).await.unwrap();
@@ -220,7 +255,6 @@ async fn garbage_frames_do_not_kill_server() {
     assert_eq!(header[4], OPCODE_ERROR);
     drop(v);
 
-    // Malformed QUERY body (truncated) -> error frame.
     let mut v = connect(addr).await;
     let frame = write_frame(&mut v, 0x04, 0x00, 0, 0x07, &[0x00, 0x01]);
     v.write_all(&frame).await.unwrap();
@@ -229,7 +263,6 @@ async fn garbage_frames_do_not_kill_server() {
     assert_eq!(header[4], OPCODE_ERROR);
     drop(v);
 
-    // Random garbage bytes on a fresh connection -> connection just dies.
     let mut v = connect(addr).await;
     let mut rng = 0x12345678u32;
     let mut garbage = Vec::new();
@@ -242,7 +275,6 @@ async fn garbage_frames_do_not_kill_server() {
     let _ = v.read(&mut buf).await;
     drop(v);
 
-    // Compressed frame without negotiated compression -> error frame.
     let mut v = connect(addr).await;
     let frame = write_frame(&mut v, 0x04, 0x01, 0, 0x07, &[0x00, 0x00, 0x00, 0x00]);
     v.write_all(&frame).await.unwrap();
@@ -251,7 +283,6 @@ async fn garbage_frames_do_not_kill_server() {
     assert_eq!(header[4], OPCODE_ERROR);
     drop(v);
 
-    // Server still alive and functional.
     let mut ok = connect(addr).await;
     let (op, _) = query(&mut ok, "SELECT * FROM g.system_schema_keyspaces_missing").await;
     assert_eq!(op, OPCODE_ERROR);
@@ -268,9 +299,17 @@ async fn persistence_across_restart() {
     let (addr, server_handle) = start_server(&dir).await;
 
     let mut c = connect(addr).await;
-    let (op, _) = query(&mut c, "CREATE KEYSPACE p WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}").await;
+    let (op, _) = query(
+        &mut c,
+        "CREATE KEYSPACE p WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+    )
+    .await;
     assert_eq!(op, OPCODE_RESULT);
-    let (op, _) = query(&mut c, "CREATE TABLE p.users (id int PRIMARY KEY, name text)").await;
+    let (op, _) = query(
+        &mut c,
+        "CREATE TABLE p.users (id int PRIMARY KEY, name text)",
+    )
+    .await;
     assert_eq!(op, OPCODE_RESULT);
     let (op, _) = query(&mut c, "INSERT INTO p.users (id, name) VALUES (1, 'alice')").await;
     assert_eq!(op, OPCODE_RESULT);
@@ -278,18 +317,30 @@ async fn persistence_across_restart() {
     assert_eq!(op, OPCODE_RESULT);
     drop(c);
 
-    // Simulate restart: stop the server (releases the RocksDB lock) and reopen
-    // the same data directory with a fresh Storage.
     server_handle.abort();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let storage = Storage::open(&dir).unwrap();
-    let table = storage.get_table("p", "users").unwrap().expect("table should survive restart");
+    let table = storage
+        .get_table("p", "users")
+        .unwrap()
+        .expect("table should survive restart");
     assert_eq!(table.columns.len(), 2);
-    let row1 = storage.get_row("p", "users", &[1i32.to_be_bytes().to_vec()]).unwrap().expect("row 1");
-    let row2 = storage.get_row("p", "users", &[2i32.to_be_bytes().to_vec()]).unwrap().expect("row 2");
+    let row1 = storage
+        .get_row("p", "users", &[1i32.to_be_bytes().to_vec()])
+        .unwrap()
+        .expect("row 1");
+    let row2 = storage
+        .get_row("p", "users", &[2i32.to_be_bytes().to_vec()])
+        .unwrap()
+        .expect("row 2");
     assert!(String::from_utf8_lossy(&row1).contains("alice"));
     assert!(String::from_utf8_lossy(&row2).contains("bob"));
-    assert!(storage.get_row("p", "users", &[3i32.to_be_bytes().to_vec()]).unwrap().is_none());
+    assert!(
+        storage
+            .get_row("p", "users", &[3i32.to_be_bytes().to_vec()])
+            .unwrap()
+            .is_none()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
