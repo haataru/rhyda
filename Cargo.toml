@@ -1,0 +1,19 @@
+[package]
+name = "rhydadb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+cql3-parser = "0.4.2"
+hex = "0.4.3"
+rocksdb = "0.24.0"
+scylla-cql = "1.8.0"
+serde = "1.0.229"
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.24.1", features = ["v4"] }
