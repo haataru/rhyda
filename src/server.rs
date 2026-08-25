@@ -203,7 +203,7 @@ async fn handle_connection(socket: TcpStream, storage: Arc<Storage>) -> anyhow::
             && opcode_raw != RequestOpcode::Execute as u8;
 
         if inline || is_session_use(&body) {
-            match handle_request(&storage, &state, opcode_raw, &body, stream, &features) {
+            match handle_request(&storage, &state, opcode_raw, &body, stream, &features).await {
                 Ok(resp) => {
                     let _ = resp_tx.send(Arc::from(resp)).await;
                 }
@@ -221,13 +221,14 @@ async fn handle_connection(socket: TcpStream, storage: Arc<Storage>) -> anyhow::
         let state = state.clone();
         let resp_tx = resp_tx.clone();
         tokio::spawn(async move {
-            let resp =
-                match handle_request(&storage, &state, opcode_raw, &body, stream, &features) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        protocol::error(version, stream, e.code, &e.message, state.compression())
-                    }
-                };
+            let resp = match handle_request(&storage, &state, opcode_raw, &body, stream, &features)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    protocol::error(version, stream, e.code, &e.message, state.compression())
+                }
+            };
             let _ = resp_tx.send(Arc::from(resp)).await;
             drop(permit);
         });
@@ -252,7 +253,7 @@ fn is_session_use(body: &[u8]) -> bool {
     }
 }
 
-fn handle_request(
+async fn handle_request(
     storage: &Storage,
     state: &ConnShared,
     opcode: u8,
@@ -267,6 +268,23 @@ fn handle_request(
         code: 0x000A,
         message: "Unknown opcode".to_string(),
     })?;
+
+    // Await micro-batch commits so a response is never sent before its write
+    // is visible in the engine's memtable (strict read-your-writes).
+    async fn settle_then(
+        storage: &Storage,
+        mut result: Result<(query::Response, Vec<crate::storage::WriteTicket>), query::QueryError>,
+        respond: impl FnOnce(query::Response) -> Vec<u8>,
+    ) -> Result<Vec<u8>, query::QueryError> {
+        match &mut result {
+            Ok((_, gates)) if !gates.is_empty() => storage.settle(gates).await,
+            _ => {}
+        }
+        match result {
+            Ok((resp, _)) => Ok(respond(resp)),
+            Err(e) => Err(e),
+        }
+    }
 
     match opcode {
         RequestOpcode::Options => Ok(protocol::supported(version, stream, compression)),
@@ -304,18 +322,16 @@ fn handle_request(
             let query_text = q.contents.to_string();
             let values: Vec<types::RawValue> = q.parameters.values.iter().collect();
             let ks = state.keyspace();
-            let result = query::execute_with_values(
-                storage,
-                ks.as_deref(),
-                &query_text,
-                &values,
-            );
-            if let Ok(resp) = &result {
-                if let query::Response::SetKeyspace(name) = resp {
+            let result = query::execute_with_values(storage, ks.as_deref(), &query_text, &values);
+            let response = settle_then(storage, result, |resp| {
+                if let query::Response::SetKeyspace(ref name) = resp {
                     state.set_keyspace(name);
                 }
-            }
-            respond(version, stream, compression, result, false)
+                respond(version, stream, compression, Ok(resp), false)
+                    .unwrap_or_else(|e| protocol::error(version, stream, e.code, &e.message, compression))
+            })
+            .await;
+            response
         }
         RequestOpcode::Prepare => {
             let mut buf: &[u8] = body;
@@ -384,13 +400,15 @@ fn handle_request(
                 });
             }
             let ks = state.keyspace();
-            respond(
-                version,
-                stream,
-                compression,
-                query::execute_prepared(storage, ks.as_deref(), &prepared.stmt, &raw_values),
-                params.skip_metadata,
-            )
+            let result =
+                query::execute_prepared(storage, ks.as_deref(), &prepared.stmt, &raw_values);
+            settle_then(storage, result, |resp| {
+                respond(version, stream, compression, Ok(resp), params.skip_metadata)
+                    .unwrap_or_else(|e| {
+                        protocol::error(version, stream, e.code, &e.message, compression)
+                    })
+            })
+            .await
         }
         RequestOpcode::Batch => Err(query::QueryError {
             code: 0x2200,

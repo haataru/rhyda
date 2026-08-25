@@ -1,7 +1,9 @@
 pub use crate::cql_value::Value;
 pub use crate::schema::ColumnType;
 use crate::schema::{KeyspaceDef, TableDef, build_table_def, ident_eq, norm_id};
-use crate::storage::{Storage, decode_key, decode_row_columns, encode_row_columns};
+use crate::storage::{
+    Storage, WriteTicket, decode_key, decode_row_columns, encode_row_columns,
+};
 use cql3_parser::cassandra_ast::CassandraAST;
 use cql3_parser::cassandra_statement::CassandraStatement;
 use cql3_parser::common::{FQName, Operand, RelationOperator};
@@ -82,7 +84,7 @@ fn put_system_schema_row(
             .ok_or_else(|| anyhow::anyhow!("column {name} missing"))?;
         row.push((idx as u16, v.clone()));
     }
-    storage.put_row("system_schema", table, &pk_parts, &encode_row_columns(&row))
+    storage.put_row_sync("system_schema", table, &pk_parts, &encode_row_columns(&row))
 }
 
 fn delete_system_schema_partition(
@@ -90,8 +92,11 @@ fn delete_system_schema_partition(
     table: &str,
     partition_key: &[Vec<u8>],
 ) -> Result<(), anyhow::Error> {
+    // Schema mirror rows may live on any engine; delete each one on the
+    // engine that holds it, synchronously.
     for (key, _) in storage.scan_partition("system_schema", table, partition_key)? {
-        storage.delete(&key)?;
+        let parts = decode_key("system_schema", table, &key)?;
+        storage.delete_row_sync("system_schema", table, &parts)?;
     }
     Ok(())
 }
@@ -301,9 +306,17 @@ pub fn execute(
     storage: &Storage,
     keyspace: Option<&str>,
     query: &str,
-) -> Result<Response, QueryError> {
+) -> Result<(Response, Vec<WriteTicket>), QueryError> {
     let stmt = parse_cached(storage, query)?;
-    execute_statement(storage, &keyspace.map(str::to_string), &stmt, &mut Binds::none())
+    let mut gates = Vec::new();
+    let resp = execute_statement(
+        storage,
+        &keyspace.map(str::to_string),
+        &stmt,
+        &mut Binds::none(),
+        &mut gates,
+    )?;
+    Ok((resp, gates))
 }
 
 pub fn execute_with_values(
@@ -311,14 +324,17 @@ pub fn execute_with_values(
     keyspace: Option<&str>,
     query: &str,
     values: &[RawValue],
-) -> Result<Response, QueryError> {
+) -> Result<(Response, Vec<WriteTicket>), QueryError> {
     let stmt = parse_cached(storage, query)?;
-    execute_statement(
+    let mut gates = Vec::new();
+    let resp = execute_statement(
         storage,
         &keyspace.map(str::to_string),
         &stmt,
         &mut Binds::new(values),
-    )
+        &mut gates,
+    )?;
+    Ok((resp, gates))
 }
 
 pub fn execute_prepared(
@@ -326,13 +342,16 @@ pub fn execute_prepared(
     keyspace: Option<&str>,
     stmt: &CassandraStatement,
     values: &[RawValue],
-) -> Result<Response, QueryError> {
-    execute_statement(
+) -> Result<(Response, Vec<WriteTicket>), QueryError> {
+    let mut gates = Vec::new();
+    let resp = execute_statement(
         storage,
         &keyspace.map(str::to_string),
         stmt,
         &mut Binds::new(values),
-    )
+        &mut gates,
+    )?;
+    Ok((resp, gates))
 }
 
 struct Binds<'a> {
@@ -371,6 +390,7 @@ fn execute_statement(
     session_ks: &Option<String>,
     stmt: &CassandraStatement,
     binds: &mut Binds,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     match stmt {
         // Session keyspace mutation is applied by the server layer after
@@ -378,13 +398,15 @@ fn execute_statement(
         CassandraStatement::Use(id) => exec_use(storage, id),
         CassandraStatement::CreateKeyspace(ks) => exec_create_keyspace(storage, ks),
         CassandraStatement::CreateTable(t) => exec_create_table(storage, session_ks, t),
-        CassandraStatement::DropKeyspace(d) => exec_drop_keyspace(storage, d),
-        CassandraStatement::DropTable(d) => exec_drop_table(storage, session_ks, d),
-        CassandraStatement::Insert(i) => exec_insert(storage, session_ks, i, binds),
+        CassandraStatement::DropKeyspace(d) => exec_drop_keyspace(storage, d, gates),
+        CassandraStatement::DropTable(d) => exec_drop_table(storage, session_ks, d, gates),
+        CassandraStatement::Insert(i) => exec_insert(storage, session_ks, i, binds, gates),
         CassandraStatement::Select(s) => exec_select(storage, session_ks, s, binds),
-        CassandraStatement::Delete(d) => exec_delete(storage, session_ks, d, binds),
-        CassandraStatement::Update(u) => exec_update(storage, session_ks, u, binds),
-        CassandraStatement::Truncate(name) => exec_truncate(storage, session_ks, name),
+        CassandraStatement::Delete(d) => exec_delete(storage, session_ks, d, binds, gates),
+        CassandraStatement::Update(u) => exec_update(storage, session_ks, u, binds, gates),
+        CassandraStatement::Truncate(name) => {
+            exec_truncate(storage, session_ks, name, gates)
+        }
         other => Err(invalid_err(format!(
             "Statement not supported: {}",
             other.short_name()
@@ -600,6 +622,7 @@ fn unmirror_table_metadata(
 fn exec_drop_keyspace(
     storage: &Storage,
     d: &cql3_parser::common_drop::CommonDrop,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let name = norm_id(&d.name.name);
     if storage.get_keyspace(&name).map_err(internal_err)?.is_none() {
@@ -611,7 +634,8 @@ fn exec_drop_keyspace(
         )));
     }
     check_writable(&name)?;
-    storage.delete_keyspace(&name).map_err(internal_err)?;
+    let tickets = storage.delete_keyspace(&name).map_err(internal_err)?;
+    gates.extend(tickets);
     for table in ["keyspaces", "tables", "columns"] {
         delete_system_schema_partition(storage, table, &[name.as_bytes().to_vec()])
             .map_err(internal_err)?;
@@ -628,6 +652,7 @@ fn exec_drop_table(
     storage: &Storage,
     session_ks: &Option<String>,
     d: &cql3_parser::common_drop::CommonDrop,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let keyspace = match &d.name.keyspace {
         Some(k) => norm_id(k),
@@ -649,9 +674,8 @@ fn exec_drop_table(
         )));
     }
     check_writable(&keyspace)?;
-    storage
-        .delete_table(&keyspace, &table)
-        .map_err(internal_err)?;
+    let tickets = storage.delete_table(&keyspace, &table).map_err(internal_err)?;
+    gates.extend(tickets);
     unmirror_table_metadata(storage, &keyspace, &table).map_err(internal_err)?;
     Ok(Response::SchemaChange {
         change: "DROPPED",
@@ -665,13 +689,15 @@ fn exec_truncate(
     storage: &Storage,
     session_ks: &Option<String>,
     name: &FQName,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let (keyspace, _) = resolve_table(storage, session_ks, name)?;
     check_writable(&keyspace)?;
     let table = norm_id(&name.name);
-    storage
+    let tickets = storage
         .truncate_table(&keyspace, &table)
         .map_err(internal_err)?;
+    gates.extend(tickets);
     Ok(Response::Void)
 }
 
@@ -680,6 +706,7 @@ fn exec_insert(
     session_ks: &Option<String>,
     ins: &cql3_parser::insert::Insert,
     binds: &mut Binds,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let (keyspace, table) = resolve_table(storage, session_ks, &ins.table_name)?;
     check_writable(&keyspace)?;
@@ -738,7 +765,7 @@ fn exec_insert(
         row_columns.push((idx as u16, v));
     }
 
-    storage
+    let ticket = storage
         .put_row(
             &keyspace,
             &table.name,
@@ -746,6 +773,7 @@ fn exec_insert(
             &encode_row_columns(&row_columns),
         )
         .map_err(internal_err)?;
+    gates.push(ticket);
     Ok(Response::Void)
 }
 
@@ -1150,6 +1178,7 @@ fn exec_delete(
     session_ks: &Option<String>,
     del: &cql3_parser::delete::Delete,
     binds: &mut Binds,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let (keyspace, table) = resolve_table(storage, session_ks, &del.table_name)?;
     check_writable(&keyspace)?;
@@ -1158,9 +1187,10 @@ fn exec_delete(
     }
     let filters = parse_filters(&table, &del.where_clause, binds)?;
     let key_parts = key_parts_from_filters(&table, &filters)?;
-    storage
+    let ticket = storage
         .delete_row(&keyspace, &table.name, &key_parts)
         .map_err(internal_err)?;
+    gates.push(ticket);
     Ok(Response::Void)
 }
 
@@ -1169,6 +1199,7 @@ fn exec_update(
     session_ks: &Option<String>,
     upd: &cql3_parser::update::Update,
     binds: &mut Binds,
+    gates: &mut Vec<WriteTicket>,
 ) -> Result<Response, QueryError> {
     let (keyspace, table) = resolve_table(storage, session_ks, &upd.table_name)?;
     check_writable(&keyspace)?;
@@ -1233,7 +1264,7 @@ fn exec_update(
         row_encoded
     };
 
-    storage
+    let ticket = storage
         .put_row(
             &keyspace,
             &table.name,
@@ -1241,5 +1272,6 @@ fn exec_update(
             &encode_row_columns(&row_encoded),
         )
         .map_err(internal_err)?;
+    gates.push(ticket);
     Ok(Response::Void)
 }

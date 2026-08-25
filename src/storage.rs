@@ -21,9 +21,38 @@ const MAX_BATCH_OPS: usize = 1024;
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+type DoneTx = tokio::sync::oneshot::Sender<()>;
+type DoneSignal = tokio::sync::oneshot::Receiver<()>;
+
 enum WriteOp {
-    Put(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
+    Put {
+        key: Vec<u8>,
+        val: Vec<u8>,
+        done: Option<DoneTx>,
+    },
+    Delete {
+        key: Vec<u8>,
+        done: Option<DoneTx>,
+    },
+    /// Range tombstone routed through the pipeline so it can never overtake
+    /// row ops queued for the same engine (DROP/TRUNCATE safety).
+    DeleteRange {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        done: Option<DoneTx>,
+    },
+}
+
+/// Handle returned to the caller for every asynchronous data write. The
+/// server awaits it before acknowledging the request, preserving strict
+/// read-your-writes without blocking any worker thread. Completion is
+/// signalled individually per op (the committer drops the sender), so one
+/// commit wakes exactly the tasks waiting on it — no broadcast herds.
+pub struct WriteTicket(Option<DoneSignal>);
+
+struct EngineWriter {
+    tx: Sender<WriteOp>,
+    handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 pub struct Storage {
@@ -34,7 +63,7 @@ pub struct Storage {
     keyspaces: RwLock<HashMap<String, KeyspaceDef>>,
     tables: RwLock<HashMap<(String, String), Arc<TableDef>>>,
     ast_cache: Mutex<HashMap<String, Arc<CassandraStatement>>>,
-    writers: Vec<Sender<WriteOp>>,
+    writers: Vec<EngineWriter>,
     write_sync: bool,
     manual_wal: bool,
     wal_ctl: Option<Sender<()>>,
@@ -44,23 +73,43 @@ pub struct Storage {
 impl Drop for Storage {
     fn drop(&mut self) {
         // Signal background threads and wait for them so every engine lock
-        // file is released before the directory can be reused.
+        // file is released and every accepted write is committed before the
+        // directory can be reused.
         drop(self.wal_ctl.take());
         if let Some(handle) = self.wal_thread.take() {
             let _ = handle.join();
         }
-        self.writers.clear();
+        // Move writers out first so every Sender handle drops: collectors
+        // observe the disconnected channel only then, finish their batches,
+        // and let the committers publish the final watermark and exit.
+        let writers: Vec<EngineWriter> = std::mem::take(&mut self.writers);
+        let mut joins = Vec::new();
+        for w in writers {
+            drop(w.tx);
+            if let Ok(mut hs) = w.handles.lock() {
+                joins.extend(hs.drain(..));
+            }
+        }
+        for h in joins {
+            let _ = h.join();
+        }
         self.dbs.clear();
     }
 }
 
-fn batch_apply(batch: &mut WriteBatch, op: WriteOp) {
+fn batch_apply(batch: &mut WriteBatch, op: WriteOp, done: &mut Vec<Option<DoneTx>>) {
     match op {
-        WriteOp::Put(k, v) => {
-            batch.put(&k, &v);
+        WriteOp::Put { key, val, done: d } => {
+            batch.put(&key, &val);
+            done.push(d);
         }
-        WriteOp::Delete(k) => {
-            batch.delete(&k);
+        WriteOp::Delete { key, done: d } => {
+            batch.delete(&key);
+            done.push(d);
+        }
+        WriteOp::DeleteRange { start, end, done: d } => {
+            batch.delete_range(&start, &end);
+            done.push(d);
         }
     }
 }
@@ -165,15 +214,14 @@ impl Storage {
             None
         };
 
-        // Durable mode: one double-buffered group-commit pipeline per engine.
-        let writers = if write_sync {
-            dbs.iter()
-                .enumerate()
-                .map(|(i, db)| spawn_writer(db.clone(), i))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Micro-batching pipelines exist in BOTH modes: collectors drain
+        // concurrent data writes into rotating WriteBatch buffers so the
+        // memtable lock is hit once per batch, not once per request.
+        let writers = dbs
+            .iter()
+            .enumerate()
+            .map(|(i, db)| spawn_writer(db.clone(), i, write_sync))
+            .collect();
 
         let storage = Self {
             dbs,
@@ -188,19 +236,6 @@ impl Storage {
         };
         storage.seed_system()?;
         Ok(storage)
-    }
-
-    /// Write options matching the current durability mode: the non-durable
-    /// path skips the WAL entirely (best-effort), while durable mode relies
-    /// on the per-engine fsync group commit.
-    fn write_opts(&self) -> WriteOptions {
-        let mut w = WriteOptions::default();
-        if self.write_sync {
-            w.set_sync(false); // group commit performs the fsync
-        } else {
-            w.disable_wal(true);
-        }
-        w
     }
 
     fn seed_system(&self) -> Result<()> {
@@ -265,7 +300,7 @@ impl Storage {
                 Value::Set(vec![Value::Text("-9223372036854775808".to_string())]),
             ),
         ];
-        self.put_row(
+        self.put_row_sync(
             "system",
             "local",
             &[b"local".to_vec()],
@@ -504,16 +539,6 @@ impl Storage {
         self.engine_of(&route)
     }
 
-    fn enqueue(&self, engine: usize, op: WriteOp) -> Result<()> {
-        if self.writers.is_empty() {
-            return Ok(());
-        }
-        self.writers[engine.min(self.writers.len() - 1)]
-            .send(op)
-            .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
-        Ok(())
-    }
-
     /// Write options for metadata/DDL: always synchronous so schema changes
     /// are immediately visible and durable regardless of data-write mode.
     fn meta_write_opts(&self) -> WriteOptions {
@@ -639,29 +664,43 @@ impl Storage {
         }
     }
 
-    /// Removes a table's data range from every engine.
-    fn delete_data_prefix(&self, data_prefix: &[u8]) -> Result<()> {
-        if let Some(end) = prefix_upper_bound(data_prefix) {
-            let wopts = self.meta_write_opts();
-            for db in &self.dbs {
-                let mut batch = WriteBatch::default();
-                batch.delete_range(data_prefix, &end);
-                db.write_opt(batch, &wopts)?;
-            }
-            Ok(())
-        } else {
-            for db in &self.dbs {
-                let iter = db.iterator(IteratorMode::From(data_prefix, Direction::Forward));
-                for item in iter {
-                    let (k, _) = item?;
-                    if !k.starts_with(data_prefix) {
-                        break;
-                    }
-                    self.delete(&k)?;
+    /// Removes a table's data range from every engine through the write
+    /// pipelines (so it cannot overtake queued row ops) and returns the
+    /// tickets the caller must settle.
+    fn delete_data_prefix(&self, data_prefix: &[u8]) -> Result<Vec<WriteTicket>> {
+        let mut tickets = Vec::new();
+        match prefix_upper_bound(data_prefix) {
+            Some(end) => {
+                for engine in 0..self.dbs.len() {
+                    let w = &self.writers[engine];
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    w.tx
+                        .send(WriteOp::DeleteRange {
+                            start: data_prefix.to_vec(),
+                            end: end.clone(),
+                            done: Some(done_tx),
+                        })
+                        .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
+                    tickets.push(WriteTicket(Some(done_rx)));
                 }
             }
-            Ok(())
+            None => {
+                // 0xFF-saturated prefix: fall back to per-row deletes.
+                for engine in 0..self.dbs.len() {
+                    self.for_each_on_engine(engine, data_prefix, |k, _| {
+                        let w = &self.writers[engine];
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        let _ = w.tx.send(WriteOp::Delete {
+                            key: k,
+                            done: Some(done_tx),
+                        });
+                        tickets.push(WriteTicket(Some(done_rx)));
+                        true
+                    })?;
+                }
+            }
         }
+        Ok(tickets)
     }
 
     pub fn put_keyspace(&self, ks: &KeyspaceDef) -> Result<()> {
@@ -698,23 +737,15 @@ impl Storage {
         }
     }
 
-    pub fn delete_keyspace(&self, name: &str) -> Result<()> {
+    pub fn delete_keyspace(&self, name: &str) -> Result<Vec<WriteTicket>> {
         let ks_key = [KS_PREFIX, name.as_bytes()].concat();
         self.delete(&ks_key)?;
         let tb_prefix = [TB_PREFIX, name.as_bytes(), b"!"].concat();
         self.delete_prefix(&tb_prefix)?;
         // Wipe every data row of the keyspace on every engine in one range
-        // delete per engine.
+        // delete per engine (routed through the pipelines).
         let dt_ks_prefix = [DT_PREFIX, name.as_bytes(), b"!"].concat();
-        if let Some(end) = prefix_upper_bound(&dt_ks_prefix) {
-            let wopts = self.meta_write_opts();
-            for db in &self.dbs {
-                let mut batch = WriteBatch::default();
-                batch.delete_range(&dt_ks_prefix, &end);
-                db.write_opt(batch, &wopts)
-                    .map_err(|e| anyhow::anyhow!("rocksdb delete_range failed: {e}"))?;
-            }
-        }
+        let tickets = self.delete_data_prefix(&dt_ks_prefix)?;
         self.keyspaces
             .write()
             .expect("keyspace cache poisoned")
@@ -723,7 +754,7 @@ impl Storage {
             .write()
             .expect("tables cache poisoned")
             .retain(|(ks, _), _| ks != name);
-        Ok(())
+        Ok(tickets)
     }
 
     pub fn put_table(&self, table: &TableDef) -> Result<()> {
@@ -768,19 +799,23 @@ impl Storage {
         }
     }
 
-    pub fn delete_table(&self, keyspace: &str, table: &str) -> Result<()> {
+    pub fn delete_table(&self, keyspace: &str, table: &str) -> Result<Vec<WriteTicket>> {
         let tb_key = [TB_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes()].concat();
         self.delete(&tb_key)?;
         let dt_prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
-        self.delete_data_prefix(&dt_prefix)?;
+        let tickets = self.delete_data_prefix(&dt_prefix)?;
         self.tables
             .write()
             .expect("tables cache poisoned")
             .remove(&(keyspace.to_string(), table.to_string()));
-        Ok(())
+        Ok(tickets)
     }
 
-    pub fn truncate_table(&self, keyspace: &str, table: &str) -> Result<()> {
+    pub fn truncate_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+    ) -> Result<Vec<WriteTicket>> {
         let dt_prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
         self.delete_data_prefix(&dt_prefix)
     }
@@ -821,7 +856,9 @@ impl Storage {
         Ok(self.dbs[engine].get(&key)?.map(|v| v.to_vec()))
     }
 
-    pub fn put_row(
+    /// Synchronous row write used only by DDL schema mirrors and seeding:
+    /// immediately visible, independent of the data pipelines.
+    pub fn put_row_sync(
         &self,
         keyspace: &str,
         table: &str,
@@ -835,16 +872,19 @@ impl Storage {
             table,
             key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
         );
-        if self.writers.is_empty() {
-            let wopts = self.write_opts();
-            return self.dbs[engine]
-                .put_opt(&key, value, &wopts)
-                .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"));
-        }
-        self.enqueue(engine, WriteOp::Put(key, value.to_vec()))
+        let wopts = self.meta_write_opts();
+        self.dbs[engine]
+            .put_opt(&key, value, &wopts)
+            .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"))
     }
 
-    pub fn delete_row(&self, keyspace: &str, table: &str, key_parts: &[Vec<u8>]) -> Result<()> {
+    /// Synchronous row delete for DDL schema mirrors.
+    pub fn delete_row_sync(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+    ) -> Result<()> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
         let engine = self.data_engine(
@@ -852,13 +892,81 @@ impl Storage {
             table,
             key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
         );
-        if self.writers.is_empty() {
-            let wopts = self.write_opts();
-            return self.dbs[engine]
-                .delete_opt(&key, &wopts)
-                .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"));
+        let wopts = self.meta_write_opts();
+        self.dbs[engine]
+            .delete_opt(&key, &wopts)
+            .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"))
+    }
+
+    /// Asynchronous micro-batched row write. Returns a ticket the caller must
+    /// settle (await) before acknowledging the request downstream.
+    pub fn put_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+        value: &[u8],
+    ) -> Result<WriteTicket> {
+        let mut key = self.data_prefix(keyspace, table);
+        key.extend(encode_key(key_parts));
+        self.write_data_op(
+            keyspace,
+            table,
+            key_parts,
+            move |done| WriteOp::Put {
+                key,
+                val: value.to_vec(),
+                done,
+            },
+        )
+    }
+
+    /// Asynchronous micro-batched row delete.
+    pub fn delete_row(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+    ) -> Result<WriteTicket> {
+        let mut key = self.data_prefix(keyspace, table);
+        key.extend(encode_key(key_parts));
+        self.write_data_op(
+            keyspace,
+            table,
+            key_parts,
+            move |done| WriteOp::Delete { key, done },
+        )
+    }
+
+    fn write_data_op(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key_parts: &[Vec<u8>],
+        op: impl FnOnce(Option<DoneTx>) -> WriteOp,
+    ) -> Result<WriteTicket> {
+        let engine = self.data_engine(
+            keyspace,
+            table,
+            key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
+        );
+        let w = &self.writers[engine];
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        w.tx
+            .send(op(Some(done_tx)))
+            .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
+        Ok(WriteTicket(Some(done_rx)))
+    }
+
+    /// Awaits until every write represented by the tickets is committed to
+    /// its engine's memtable. Never blocks a worker thread; drains in place.
+    pub async fn settle(&self, tickets: &mut Vec<WriteTicket>) {
+        for t in tickets.iter_mut() {
+            if let Some(rx) = t.0.take() {
+                let _ = rx.await;
+            }
         }
-        self.enqueue(engine, WriteOp::Delete(key))
+        tickets.clear();
     }
 
     #[allow(dead_code)]
@@ -909,48 +1017,68 @@ fn col(name: &str, col_type: ColumnType, is_partition_key: bool) -> ColumnDef {
     }
 }
 
-/// Durable mode only: per-engine pipeline where a collector drains operations
-/// into rotating buffers while a committer performs the fsync'd write. The
-/// collector never blocks on disk, so writers keep flowing ("no stop").
-fn spawn_writer(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
+/// Per-engine micro-batching pipeline: a collector drains concurrent data
+/// writes into rotating WriteBatch buffers (up to MAX_BATCH_OPS ops each)
+/// while a committer performs the actual RocksDB write and publishes the
+/// committed ticket watermark. The collector never blocks on disk, so writers
+/// keep flowing ("no stop"), and each memtable lock acquisition is amortized
+/// over a whole batch.
+fn spawn_writer(db: Arc<DB>, id: usize, write_sync: bool) -> EngineWriter {
     let (ops_tx, ops_rx) = channel::<WriteOp>();
-    let (commit_tx, commit_rx) = channel::<WriteBatch>();
+    let (commit_tx, commit_rx) = channel::<(WriteBatch, Vec<Option<DoneTx>>)>();
+
+    let handles: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
     {
-        thread::Builder::new()
+        let h = thread::Builder::new()
             .name(format!("rhyda-collector-{id}"))
             .spawn(move || {
                 while let Ok(first) = ops_rx.recv() {
                     let mut batch = WriteBatch::default();
-                    batch_apply(&mut batch, first);
+                    let mut done: Vec<Option<DoneTx>> = Vec::new();
+                    batch_apply(&mut batch, first, &mut done);
                     while batch.len() < MAX_BATCH_OPS {
                         match ops_rx.try_recv() {
-                            Ok(op) => batch_apply(&mut batch, op),
+                            Ok(op) => batch_apply(&mut batch, op, &mut done),
                             Err(_) => break,
                         }
                     }
-                    if commit_tx.send(batch).is_err() {
+                    if commit_tx.send((batch, done)).is_err() {
                         return;
                     }
                 }
+                drop(commit_tx);
             })
             .expect("spawn collector");
+        handles.lock().expect("handles").push(h);
     }
 
-    thread::Builder::new()
-        .name(format!("rhyda-committer-{id}"))
-        .spawn(move || {
-            let mut wopts = WriteOptions::default();
-            wopts.set_sync(true);
-            while let Ok(batch) = commit_rx.recv() {
-                if let Err(e) = db.write_opt(batch, &wopts) {
-                    eprintln!("rhyda-committer-{id}: write batch failed: {e}");
+    {
+        let committed_tx = ();
+        let _ = committed_tx;
+        let h = thread::Builder::new()
+            .name(format!("rhyda-committer-{id}"))
+            .spawn(move || {
+                let mut wopts = WriteOptions::default();
+                if write_sync {
+                    wopts.set_sync(true);
+                } else {
+                    wopts.disable_wal(true);
                 }
-            }
-        })
-        .expect("spawn committer");
+                while let Ok((batch, done)) = commit_rx.recv() {
+                    if let Err(e) = db.write_opt(batch, &wopts) {
+                        eprintln!("rhyda-committer-{id}: write batch failed: {e}");
+                    }
+                    // Dropping the senders completes every waiter of this
+                    // batch — one wakeup per waiting task, nothing more.
+                    drop(done);
+                }
+            })
+            .expect("spawn committer");
+        handles.lock().expect("handles").push(h);
+    }
 
-    ops_tx
+    EngineWriter { tx: ops_tx, handles }
 }
 
 pub fn encode_key(parts: &[Vec<u8>]) -> Vec<u8> {
