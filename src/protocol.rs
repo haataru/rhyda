@@ -13,13 +13,14 @@ pub fn response_frame(
     compression: Option<Compression>,
 ) -> Vec<u8> {
     let mut flags = 0u8;
-    let mut payload = body.to_vec();
-    if let Some(comp) = compression {
+    let payload: Vec<u8> = if let Some(comp) = compression {
         flags |= 0x01;
         let mut compressed = Vec::new();
-        types_compress(body, comp, &mut compressed);
-        payload = compressed;
-    }
+        scylla_cql::frame::compress_append(body, comp, &mut compressed).expect("compression failed");
+        compressed
+    } else {
+        body.to_vec()
+    };
     let mut out = Vec::with_capacity(9 + payload.len());
     out.push(version | 0x80);
     out.push(flags);
@@ -28,10 +29,6 @@ pub fn response_frame(
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(&payload);
     out
-}
-
-fn types_compress(body: &[u8], comp: Compression, out: &mut Vec<u8>) {
-    scylla_cql::frame::compress_append(body, comp, out).expect("compression failed");
 }
 
 pub fn ready(version: u8, stream: i16, compression: Option<Compression>) -> Vec<u8> {

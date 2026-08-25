@@ -2,13 +2,12 @@ use crate::cql_value::Value;
 use crate::schema::{ColumnDef, ColumnType, KeyspaceDef, TableDef};
 use anyhow::Result;
 use cql3_parser::cassandra_statement::CassandraStatement;
-use rocksdb::{DB, Direction, IteratorMode, WriteBatch, WriteOptions};
+use rocksdb::{DB, DBCompressionType, Direction, IteratorMode, Options, WriteBatch};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -18,9 +17,9 @@ const DT_PREFIX: &[u8] = b"dt!";
 
 const AST_CACHE_CAPACITY: usize = 8192;
 
-const MAX_BATCH_OPS: usize = 512;
+const MAX_BATCH_OPS: usize = 1024;
 
-const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 enum WriteOp {
     Put(Vec<u8>, Vec<u8>),
@@ -30,11 +29,22 @@ enum WriteOp {
 pub struct Storage {
     db: Arc<DB>,
     keyspaces: RwLock<HashMap<String, KeyspaceDef>>,
-    tables: RwLock<HashMap<(String, String), TableDef>>,
+    tables: RwLock<HashMap<(String, String), Arc<TableDef>>>,
     ast_cache: Mutex<HashMap<String, Arc<CassandraStatement>>>,
-    ops_tx: Sender<WriteOp>,
-    sent_seq: Arc<AtomicU64>,
-    flushed: Arc<(Mutex<u64>, Condvar)>,
+    shards: Vec<Sender<WriteOp>>,
+    wal_ctl: Option<Sender<()>>,
+    wal_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        // Signal the periodic WAL flusher and wait for it to exit so the
+        // RocksDB lock file is released before the directory is reused.
+        drop(self.wal_ctl.take());
+        if let Some(handle) = self.wal_thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn batch_apply(batch: &mut WriteBatch, op: WriteOp) {
@@ -48,53 +58,97 @@ fn batch_apply(batch: &mut WriteBatch, op: WriteOp) {
     }
 }
 
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn env_num(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let db = Arc::new(DB::open(&opts, path)?);
+        let cpus = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let write_sync = std::env::var("RHYDADB_SYNC").is_ok();
-        let writer_db = db.clone();
-        let (ops_tx, ops_rx) = channel::<WriteOp>();
-        let sent_seq = Arc::new(AtomicU64::new(0));
-        let flushed = Arc::new((Mutex::new(0u64), Condvar::new()));
-        {
-            let flushed = flushed.clone();
-            let mut wopts = WriteOptions::default();
-            if write_sync {
-                wopts.set_sync(true);
-            }
-            thread::Builder::new()
-                .name("rhydadb-writer".to_string())
-                .spawn(move || writer_loop(writer_db, ops_rx, flushed, wopts))?;
+        let cache_mb = env_num("RHYDADB_CACHE_MB", 256, 8, 1 << 20);
+        let memtable_mb = env_num("RHYDADB_MEMTABLE_MB", 64, 8, 4096);
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(DBCompressionType::Lz4);
+        opts.increase_parallelism(cpus as i32);
+        opts.set_max_background_jobs(cpus as i32);
+        opts.optimize_level_style_compaction(memtable_mb * 1024 * 1024 * 2);
+        opts.set_write_buffer_size(memtable_mb * 1024 * 1024);
+        opts.set_max_write_buffer_number(6);
+        opts.set_min_write_buffer_number_to_merge(2);
+
+        let mut bb_opts = rocksdb::BlockBasedOptions::default();
+        let cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
+        bb_opts.set_block_cache(&cache);
+        bb_opts.set_block_size(16 * 1024);
+        bb_opts.set_bloom_filter(10.0, true);
+        bb_opts.set_cache_index_and_filter_blocks(true);
+        bb_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        opts.set_block_based_table_factory(&bb_opts);
+
+        if !write_sync {
+            // Cassandra-like periodic commitlog durability: buffer WAL in
+            // memory and flush it on a timer instead of per-write syscalls.
+            opts.set_manual_wal_flush(true);
         }
+
+        let db = Arc::new(DB::open(&opts, path)?);
+
+        let wal_thread: Option<(Sender<()>, thread::JoinHandle<()>)> = if !write_sync {
+            let wal_db = db.clone();
+            let (wal_ctl, wal_rx) = channel::<()>();
+            let wal_thread = thread::Builder::new()
+                .name("rhydadb-wal-flush".to_string())
+                .spawn(move || loop {
+                    match wal_rx.recv_timeout(WAL_FLUSH_INTERVAL) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    let _ = wal_db.flush_wal(true);
+                })?;
+            Some((wal_ctl, wal_thread))
+        } else {
+            None
+        };
+
+        let shards = if write_sync {
+            let shard_count = env_num("RHYDADB_WRITE_SHARDS", cpus.clamp(1, 16), 1, 64);
+            (0..shard_count)
+                .map(|i| spawn_shard(db.clone(), i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let storage = Self {
             db,
             keyspaces: RwLock::new(HashMap::new()),
             tables: RwLock::new(HashMap::new()),
             ast_cache: Mutex::new(HashMap::new()),
-            ops_tx,
-            sent_seq,
-            flushed,
+            shards,
+            wal_ctl: wal_thread.as_ref().map(|(ctl, _)| ctl.clone()),
+            wal_thread: wal_thread.map(|(_, handle)| handle),
         };
         storage.seed_system()?;
         Ok(storage)
-    }
-
-    fn flush(&self) {
-        let sent = self.sent_seq.load(Ordering::SeqCst);
-        if sent == 0 {
-            return;
-        }
-        let (lock, cv) = &*self.flushed;
-        let mut flushed = lock.lock().expect("flush lock poisoned");
-        while *flushed < sent {
-            let (guard, _) = cv
-                .wait_timeout(flushed, FLUSH_TIMEOUT)
-                .expect("flush condvar poisoned");
-            flushed = guard;
-        }
     }
 
     fn seed_system(&self) -> Result<()> {
@@ -377,48 +431,90 @@ impl Storage {
         Ok(())
     }
 
-    pub fn put(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        self.sent_seq.fetch_add(1, Ordering::SeqCst);
-        self.ops_tx
-            .send(WriteOp::Put(key.to_vec(), val.to_vec()))
+    fn enqueue(&self, key: &[u8], op: impl FnOnce() -> WriteOp) -> Result<()> {
+        if self.shards.is_empty() {
+            return Ok(());
+        }
+        let idx = (fnv1a(key) % self.shards.len() as u64) as usize;
+        self.shards[idx]
+            .send(op())
             .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
         Ok(())
     }
 
+    pub fn put(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        if self.shards.is_empty() {
+            return self
+                .db
+                .put(key, val)
+                .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"));
+        }
+        let k = key.to_vec();
+        let v = val.to_vec();
+        self.enqueue(key, move || WriteOp::Put(k, v))
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.flush();
         Ok(self.db.get(key)?.map(|v| v.to_vec()))
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.sent_seq.fetch_add(1, Ordering::SeqCst);
-        self.ops_tx
-            .send(WriteOp::Delete(key.to_vec()))
-            .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
-        Ok(())
+        if self.shards.is_empty() {
+            return self
+                .db
+                .delete(key)
+                .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"));
+        }
+        let k = key.to_vec();
+        self.enqueue(key, || WriteOp::Delete(k))
     }
 
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.flush();
+        let mut out = Vec::new();
+        self.for_each_in_prefix(prefix, |k, v| {
+            out.push((k, v));
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Streams entries under `prefix`; the callback returns false to stop
+    /// early (no further RocksDB reads are performed after that).
+    pub fn for_each_in_prefix<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> bool,
+    {
         let iter = self
             .db
             .iterator(IteratorMode::From(prefix, Direction::Forward));
-        let mut out = Vec::new();
         for item in iter {
             let (k, v) = item?;
             if !k.starts_with(prefix) {
                 break;
             }
-            out.push((k.to_vec(), v.to_vec()));
+            if !f(k.into(), v.into()) {
+                break;
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn delete_prefix(&self, prefix: &[u8]) -> Result<()> {
-        for (k, _) in self.scan_prefix(prefix)? {
-            self.db.delete(k)?;
+        match prefix_upper_bound(prefix) {
+            Some(end) => {
+                let mut batch = WriteBatch::default();
+                batch.delete_range(prefix, &end);
+                self.db
+                    .write_opt(batch, &Default::default())
+                    .map_err(|e| anyhow::anyhow!("rocksdb delete_range failed: {e}"))
+            }
+            None => {
+                for (k, _) in self.scan_prefix(prefix)? {
+                    self.delete(&k)?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn put_keyspace(&self, ks: &KeyspaceDef) -> Result<()> {
@@ -482,14 +578,15 @@ impl Storage {
         ]
         .concat();
         self.put(&key, &serde_json::to_vec(table)?)?;
+        let arc = Arc::new(table.clone());
         self.tables
             .write()
             .expect("tables cache poisoned")
-            .insert((table.keyspace.clone(), table.name.clone()), table.clone());
+            .insert((table.keyspace.clone(), table.name.clone()), arc);
         Ok(())
     }
 
-    pub fn get_table(&self, keyspace: &str, table: &str) -> Result<Option<TableDef>> {
+    pub fn get_table(&self, keyspace: &str, table: &str) -> Result<Option<Arc<TableDef>>> {
         if let Some(def) = self
             .tables
             .read()
@@ -503,6 +600,7 @@ impl Storage {
         match self.get(&key)? {
             Some(bytes) => {
                 let def: TableDef = serde_json::from_slice(&bytes)?;
+                let def = Arc::new(def);
                 self.tables
                     .write()
                     .expect("tables cache poisoned")
@@ -593,6 +691,23 @@ impl Storage {
         prefix.extend(encode_key(partition_key));
         self.scan_prefix(&prefix)
     }
+
+    pub fn data_prefix_for(&self, keyspace: &str, table: &str) -> Vec<u8> {
+        self.data_prefix(keyspace, table)
+    }
+}
+
+/// Exclusive end bound covering everything that starts with `prefix`.
+/// Returns None when every byte is 0xFF (unbounded increment).
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for b in end.iter_mut().rev() {
+        if *b < 0xFF {
+            *b += 1;
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn col(name: &str, col_type: ColumnType, is_partition_key: bool) -> ColumnDef {
@@ -604,40 +719,52 @@ fn col(name: &str, col_type: ColumnType, is_partition_key: bool) -> ColumnDef {
     }
 }
 
-fn writer_loop(
-    db: Arc<DB>,
-    ops_rx: Receiver<WriteOp>,
-    flushed: Arc<(Mutex<u64>, Condvar)>,
-    wopts: WriteOptions,
-) {
-    let mut seq = 0u64;
-    loop {
-        let first = match ops_rx.recv() {
-            Ok(op) => op,
-            Err(_) => {
-                return;
-            }
-        };
-        let mut batch = WriteBatch::default();
-        batch_apply(&mut batch, first);
-        let mut n = 1usize;
-        while n < MAX_BATCH_OPS {
-            match ops_rx.try_recv() {
-                Ok(op) => {
-                    batch_apply(&mut batch, op);
-                    n += 1;
+/// Durable mode only: per-shard pipeline where a collector drains operations
+/// into rotating buffers while a committer performs the fsync'd write. The
+/// collector never blocks on disk, so writers keep flowing ("no stop").
+fn spawn_shard(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
+    let (ops_tx, ops_rx) = channel::<WriteOp>();
+    let (commit_tx, commit_rx) = channel::<WriteBatch>();
+
+    {
+        thread::Builder::new()
+            .name(format!("rhyda-collector-{id}"))
+            .spawn(move || {
+                while let Ok(first) = ops_rx.recv() {
+                    let mut batch = WriteBatch::default();
+                    batch_apply(&mut batch, first);
+                    let mut n = 1usize;
+                    while n < MAX_BATCH_OPS {
+                        match ops_rx.try_recv() {
+                            Ok(op) => {
+                                batch_apply(&mut batch, op);
+                                n += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if commit_tx.send(batch).is_err() {
+                        return;
+                    }
                 }
-                Err(_) => break,
-            }
-        }
-        if let Err(e) = db.write_opt(batch, &wopts) {
-            eprintln!("storage writer: write batch failed: {e}");
-        }
-        seq += n as u64;
-        let (lock, cv) = &*flushed;
-        *lock.lock().expect("flush lock poisoned") = seq;
-        cv.notify_all();
+            })
+            .expect("spawn collector");
     }
+
+    thread::Builder::new()
+        .name(format!("rhyda-committer-{id}"))
+        .spawn(move || {
+            let mut wopts = rocksdb::WriteOptions::default();
+            wopts.set_sync(true);
+            while let Ok(batch) = commit_rx.recv() {
+                if let Err(e) = db.write_opt(batch, &wopts) {
+                    eprintln!("rhyda-committer-{id}: write batch failed: {e}");
+                }
+            }
+        })
+        .expect("spawn committer");
+
+    ops_tx
 }
 
 pub fn encode_key(parts: &[Vec<u8>]) -> Vec<u8> {

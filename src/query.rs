@@ -7,7 +7,8 @@ use cql3_parser::cassandra_statement::CassandraStatement;
 use cql3_parser::common::{FQName, Operand, RelationOperator};
 use cql3_parser::select::SelectElement;
 use scylla_cql::frame::types::RawValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 fn strip_quotes(s: &str) -> String {
     s.trim()
@@ -150,7 +151,7 @@ pub fn prepared_info(
             }
             Ok(PreparedInfo {
                 keyspace,
-                table: table.name,
+                table: table.name.clone(),
                 bind_specs,
                 pk_indexes,
                 result_cols: vec![],
@@ -169,7 +170,7 @@ pub fn prepared_info(
             collect_where_binds(&table, &u.where_clause, &mut bind_specs)?;
             Ok(PreparedInfo {
                 keyspace,
-                table: table.name,
+                table: table.name.clone(),
                 bind_specs,
                 pk_indexes: vec![],
                 result_cols: vec![],
@@ -182,7 +183,7 @@ pub fn prepared_info(
             let result_cols = select_columns(&table, &s.columns)?;
             Ok(PreparedInfo {
                 keyspace,
-                table: table.name,
+                table: table.name.clone(),
                 bind_specs,
                 pk_indexes: vec![],
                 result_cols,
@@ -194,7 +195,7 @@ pub fn prepared_info(
             collect_where_binds(&table, &d.where_clause, &mut bind_specs)?;
             Ok(PreparedInfo {
                 keyspace,
-                table: table.name,
+                table: table.name.clone(),
                 bind_specs,
                 pk_indexes: vec![],
                 result_cols: vec![],
@@ -381,7 +382,7 @@ fn resolve_table(
     storage: &Storage,
     session_ks: &Option<String>,
     name: &FQName,
-) -> Result<(String, TableDef), QueryError> {
+) -> Result<(String, Arc<TableDef>), QueryError> {
     let keyspace = match &name.keyspace {
         Some(k) => norm_id(k),
         None => session_ks
@@ -882,7 +883,47 @@ fn exec_select(
 
     let filters = parse_filters(&table, &sel.where_clause, binds)?;
 
-    let mut fetched: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let limit: Option<usize> = sel.limit.map(|l| l as usize);
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+
+    // Fastest path: every partition-key AND clustering-key part is restricted
+    // by '=' — the row address is fully known, use a direct point lookup.
+    let point_key: Option<Vec<Vec<u8>>> = {
+        let mut parts = Vec::new();
+        let mut complete = true;
+        for name in table.partition_keys.iter().chain(table.clustering_keys.iter()) {
+            match filters.iter().find_map(|f| match f {
+                Filter::Eq(n, v) if n == name => Some(v),
+                _ => None,
+            }) {
+                Some(v) if *v != Value::Null => parts.push(v.raw_bytes()),
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        complete.then_some(parts)
+    };
+
+    if let Some(key_parts) = point_key {
+        if let Some(bytes) = storage
+            .get_row(&keyspace, &table.name, &key_parts)
+            .map_err(internal_err)?
+        {
+            let key = [
+                storage.data_prefix_for(&keyspace, &table.name),
+                crate::storage::encode_key(&key_parts),
+            ]
+            .concat();
+            project_row(&table, &selected, &filters, &key, &bytes, &keyspace, &mut out_rows)
+                .map_err(internal_err)?;
+        }
+        return finish_select(keyspace, table, selected, out_rows);
+    }
+
+    let mut error_slot: Option<anyhow::Error> = None;
+
     let mut pk_restricted = true;
     for pk in &table.partition_keys {
         let restricted = filters.iter().any(|f| match f {
@@ -918,83 +959,150 @@ fn exec_select(
             }
             partitions = next;
         }
-        for partition in partitions {
-            fetched.extend(
-                storage
-                    .scan_partition(&keyspace, &table.name, &partition)
-                    .map_err(internal_err)?,
-            );
+        'parts: for partition in partitions {
+            let mut prefix = storage.data_prefix_for(&keyspace, &table.name);
+            prefix.extend(crate::storage::encode_key(&partition));
+            let mut done = false;
+            storage
+                .for_each_in_prefix(&prefix, |k, v| {
+                    let cont = handle_entry(
+                        &table,
+                        &selected,
+                        &filters,
+                        &keyspace,
+                        limit,
+                        k,
+                        v,
+                        &mut out_rows,
+                        &mut error_slot,
+                    );
+                    if !cont {
+                        done = true;
+                    }
+                    cont
+                })
+                .map_err(internal_err)?;
+            if done || error_slot.is_some() {
+                break 'parts;
+            }
         }
     } else {
-        fetched.extend(
-            storage
-                .scan_rows(&keyspace, &table.name)
-                .map_err(internal_err)?,
-        );
+        let prefix = storage.data_prefix_for(&keyspace, &table.name);
+        storage
+            .for_each_in_prefix(&prefix, |k, v| {
+                handle_entry(
+                    &table,
+                    &selected,
+                    &filters,
+                    &keyspace,
+                    limit,
+                    k,
+                    v,
+                    &mut out_rows,
+                    &mut error_slot,
+                )
+            })
+            .map_err(internal_err)?;
     }
 
-    let mut out_rows: Vec<Vec<Value>> = Vec::new();
-    for (key, value_bytes) in fetched {
-        let key_parts = decode_key(&keyspace, &table.name, &key).map_err(internal_err)?;
-        let mut row_columns = decode_row_columns(&value_bytes, &table).map_err(internal_err)?;
-
-        let mut part_idx = 0;
-        for col in &table.columns {
-            if col.is_partition_key || col.is_clustering {
-                if part_idx < key_parts.len() {
-                    row_columns[table.column_index(&col.name).unwrap()] =
-                        Value::from_raw_bytes(&key_parts[part_idx], &col.col_type)
-                            .map_err(internal_err)?;
-                }
-                part_idx += 1;
-            }
-        }
-
-        let mut passes = true;
-        for f in &filters {
-            let (name, expected) = match f {
-                Filter::Eq(name, v) => (name, v),
-                Filter::In(name, vs) => {
-                    let idx = table.column_index(name).unwrap();
-                    match vs.iter().find(|v| **v == row_columns[idx]) {
-                        Some(v) => (name, v),
-                        None => {
-                            passes = false;
-                            break;
-                        }
-                    }
-                }
-            };
-            let idx = table.column_index(name).unwrap();
-            if *expected != row_columns[idx] {
-                passes = false;
-                break;
-            }
-        }
-        if !passes {
-            continue;
-        }
-
-        let mut out = Vec::new();
-        for (name, _) in &selected {
-            let idx = table.column_index(name).unwrap();
-            out.push(row_columns[idx].clone());
-        }
-        out_rows.push(out);
-
-        if let Some(limit) = sel.limit
-            && out_rows.len() as i32 >= limit
-        {
-            break;
-        }
+    if let Some(e) = error_slot {
+        return Err(internal_err(e));
     }
 
+    finish_select(keyspace, table, selected, out_rows)
+}
+
+fn finish_select(
+    keyspace: String,
+    table: Arc<TableDef>,
+    selected: Vec<(String, ColumnType)>,
+    rows: Vec<Vec<Value>>,
+) -> Result<Response, QueryError> {
     Ok(Response::Rows {
         keyspace,
-        table: table.name,
+        table: table.name.clone(),
         cols: selected,
-        rows: out_rows,
+        rows,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_entry(
+    table: &TableDef,
+    selected: &[(String, ColumnType)],
+    filters: &[Filter],
+    keyspace: &str,
+    limit: Option<usize>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    out_rows: &mut Vec<Vec<Value>>,
+    error_slot: &mut Option<anyhow::Error>,
+) -> bool {
+    match project_row(table, selected, filters, &key, &value, keyspace, out_rows) {
+        Ok(true) => match limit {
+            Some(l) => out_rows.len() < l,
+            None => true,
+        },
+        Ok(false) => true,
+        Err(e) => {
+            if error_slot.is_none() {
+                *error_slot = Some(e);
+            }
+            false
+        }
+    }
+}
+
+/// Decodes one stored entry into a projected output row.
+/// Returns Ok(true) when the row was emitted, Ok(false) when filtered out.
+fn project_row(
+    table: &TableDef,
+    selected: &[(String, ColumnType)],
+    filters: &[Filter],
+    key: &[u8],
+    value_bytes: &[u8],
+    keyspace: &str,
+    out_rows: &mut Vec<Vec<Value>>,
+) -> Result<bool, anyhow::Error> {
+    let key_parts = decode_key(keyspace, &table.name, key)?;
+    let mut row_columns = decode_row_columns(value_bytes, table)?;
+
+    let mut part_idx = 0;
+    for col in &table.columns {
+        if col.is_partition_key || col.is_clustering {
+            if part_idx < key_parts.len() {
+                let idx = table.column_index(&col.name).unwrap();
+                row_columns[idx] =
+                    Value::from_raw_bytes(&key_parts[part_idx], &col.col_type)?;
+            }
+            part_idx += 1;
+        }
+    }
+
+    for f in filters {
+        let (name, expected) = match f {
+            Filter::Eq(name, v) => (&name[..], v),
+            Filter::In(name, vs) => {
+                let idx = table.column_index(&name[..]).unwrap();
+                match vs.iter().find(|v| **v == row_columns[idx]) {
+                    Some(v) => (&name[..], v),
+                    None => return Ok(false),
+                }
+            }
+        };
+        let idx = table.column_index(name).unwrap();
+        if *expected != row_columns[idx] {
+            return Ok(false);
+        }
+    }
+
+    let mut out = Vec::with_capacity(selected.len());
+    for (name, _) in selected {
+        let idx = table.column_index(name).unwrap();
+        out.push(row_columns[idx].clone());
+    }
+    out_rows.push(out);
+    Ok(true)
 }
 
 fn key_parts_from_filters(
@@ -1072,24 +1180,48 @@ fn exec_update(
     let filters = parse_filters(&table, &upd.where_clause, binds)?;
     let key_parts = key_parts_from_filters(&table, &filters)?;
 
-    let existing = storage
-        .get_row(&keyspace, &table.name, &key_parts)
-        .map_err(internal_err)?;
-    let mut row_columns: Vec<Value> = match existing {
-        Some(bytes) => decode_row_columns(&bytes, &table).map_err(internal_err)?,
-        None => vec![Value::Null; table.columns.len()],
-    };
-    for (idx, v) in new_values {
-        row_columns[idx] = v;
-    }
+    // Upsert fast path: when the statement assigns every regular column,
+    // the stored row is fully determined — skip the read-modify-write.
+    let regular_count = table
+        .columns
+        .iter()
+        .filter(|c| !c.is_partition_key && !c.is_clustering)
+        .count();
+    let mut seen = HashSet::new();
+    let covers_all_regular = new_values.len() == regular_count
+        && new_values.iter().all(|(i, _)| seen.insert(*i));
 
-    let mut row_encoded = Vec::new();
-    for (idx, col) in table.columns.iter().enumerate() {
-        if col.is_partition_key || col.is_clustering {
-            continue;
+    let row_encoded: Vec<(u16, Value)> = if covers_all_regular {
+        let assigned: HashMap<usize, Value> = new_values.into_iter().collect();
+        let mut out = Vec::with_capacity(regular_count);
+        for (idx, col) in table.columns.iter().enumerate() {
+            if col.is_partition_key || col.is_clustering {
+                continue;
+            }
+            out.push((idx as u16, assigned[&idx].clone()));
         }
-        row_encoded.push((idx as u16, row_columns[idx].clone()));
-    }
+        out
+    } else {
+        let existing = storage
+            .get_row(&keyspace, &table.name, &key_parts)
+            .map_err(internal_err)?;
+        let mut row_columns: Vec<Value> = match existing {
+            Some(bytes) => decode_row_columns(&bytes, &table).map_err(internal_err)?,
+            None => vec![Value::Null; table.columns.len()],
+        };
+        for (idx, v) in new_values {
+            row_columns[idx] = v;
+        }
+        let mut row_encoded = Vec::new();
+        for (idx, col) in table.columns.iter().enumerate() {
+            if col.is_partition_key || col.is_clustering {
+                continue;
+            }
+            row_encoded.push((idx as u16, row_columns[idx].clone()));
+        }
+        row_encoded
+    };
+
     storage
         .put_row(
             &keyspace,
