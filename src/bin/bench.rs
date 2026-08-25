@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 const OPCODE_ERROR: u8 = 0x00;
 const OPCODE_READY: u8 = 0x02;
-const OPCODE_RESULT: u8 = 0x08;
 
 #[derive(Clone)]
 struct Args {

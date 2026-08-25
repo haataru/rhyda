@@ -70,7 +70,6 @@ pub struct Storage {
     ast_cache: Mutex<HashMap<String, Arc<CassandraStatement>>>,
     writers: Vec<EngineWriter>,
     write_sync: bool,
-    manual_wal: bool,
     wal_ctl: Option<Sender<()>>,
     wal_thread: Option<thread::JoinHandle<()>>,
 }
@@ -235,7 +234,6 @@ impl Storage {
             ast_cache: Mutex::new(HashMap::new()),
             writers,
             write_sync,
-            manual_wal,
             wal_ctl: wal_thread.as_ref().map(|(ctl, _)| ctl.clone()),
             wal_thread: wal_thread.map(|(_, handle)| handle),
         };
@@ -639,7 +637,7 @@ impl Storage {
         keyspace: &str,
         table: &str,
         partition: &[Vec<u8>],
-        mut f: F,
+        f: F,
     ) -> Result<()>
     where
         F: FnMut(Vec<u8>, Vec<u8>) -> bool,
