@@ -2,7 +2,7 @@ use crate::cql_value::Value;
 use crate::schema::{ColumnDef, ColumnType, KeyspaceDef, TableDef};
 use anyhow::Result;
 use cql3_parser::cassandra_statement::CassandraStatement;
-use rocksdb::{DB, DBCompressionType, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{DB, DBCompressionType, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -27,23 +27,30 @@ enum WriteOp {
 }
 
 pub struct Storage {
-    db: Arc<DB>,
+    /// Independent RocksDB instances. Index 0 holds metadata (`ks!`/`tb!`)
+    /// plus data when only one engine is configured; data is distributed
+    /// across all of them by partition hash.
+    dbs: Vec<Arc<DB>>,
     keyspaces: RwLock<HashMap<String, KeyspaceDef>>,
     tables: RwLock<HashMap<(String, String), Arc<TableDef>>>,
     ast_cache: Mutex<HashMap<String, Arc<CassandraStatement>>>,
-    shards: Vec<Sender<WriteOp>>,
+    writers: Vec<Sender<WriteOp>>,
+    write_sync: bool,
+    manual_wal: bool,
     wal_ctl: Option<Sender<()>>,
     wal_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        // Signal the periodic WAL flusher and wait for it to exit so the
-        // RocksDB lock file is released before the directory is reused.
+        // Signal background threads and wait for them so every engine lock
+        // file is released before the directory can be reused.
         drop(self.wal_ctl.take());
         if let Some(handle) = self.wal_thread.take() {
             let _ = handle.join();
         }
+        self.writers.clear();
+        self.dbs.clear();
     }
 }
 
@@ -77,22 +84,43 @@ fn env_num(name: &str, default: usize, min: usize, max: usize) -> usize {
 
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let cpus = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let write_sync = std::env::var("RHYDADB_SYNC").is_ok();
-        let cache_mb = env_num("RHYDADB_CACHE_MB", 256, 8, 1 << 20);
-        let memtable_mb = env_num("RHYDADB_MEMTABLE_MB", 64, 8, 4096);
+        let cache_mb = env_num("RHYDADB_CACHE_MB", 1024, 8, 1 << 20);
+        let memtable_mb = env_num("RHYDADB_MEMTABLE_MB", 128, 8, 4096);
+
+        // The engine shard count is persisted on first open so restarts never
+        // misroute rows written under a different layout.
+        let root = path.as_ref().to_path_buf();
+        let marker = root.join("ENGINE-SHARDS");
+        let shard_count: usize = match std::fs::read_to_string(&marker) {
+            Ok(text) => text.trim().parse().unwrap_or(1),
+            Err(_) => {
+                let n = env_num(
+                    "RHYDADB_ENGINE_SHARDS",
+                    cpus.clamp(2, 8).min(8),
+                    1,
+                    64,
+                );
+                std::fs::create_dir_all(&root)?;
+                std::fs::write(&marker, n.to_string())?;
+                n
+            }
+        };
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.increase_parallelism(cpus as i32);
-        opts.set_max_background_jobs(cpus as i32);
+        opts.set_max_background_jobs((cpus / shard_count.max(1)).clamp(2, 8) as i32);
         opts.optimize_level_style_compaction(memtable_mb * 1024 * 1024 * 2);
         opts.set_write_buffer_size(memtable_mb * 1024 * 1024);
         opts.set_max_write_buffer_number(6);
         opts.set_min_write_buffer_number_to_merge(2);
+        // Let concurrent writers insert into the memtable in parallel instead
+        // of serializing every write on one critical section.
+        opts.set_allow_concurrent_memtable_write(true);
+        opts.set_enable_write_thread_adaptive_yield(true);
 
         let mut bb_opts = rocksdb::BlockBasedOptions::default();
         let cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
@@ -103,18 +131,24 @@ impl Storage {
         bb_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         opts.set_block_based_table_factory(&bb_opts);
 
-        if !write_sync {
-            // Cassandra-like periodic commitlog durability: buffer WAL in
-            // memory and flush it on a timer instead of per-write syscalls.
+        // Manual WAL buffering batches syscalls but its periodic flush holds
+        // the WAL mutex long enough to stall writers; keep it opt-in.
+        let manual_wal = std::env::var("RHYDADB_MANUAL_WAL").is_ok() && !write_sync;
+        if manual_wal {
             opts.set_manual_wal_flush(true);
         }
 
-        let db = Arc::new(DB::open(&opts, path)?);
+        let mut dbs = Vec::with_capacity(shard_count);
+        for i in 0..shard_count {
+            let dir = root.join(format!("engine-{i}"));
+            let db = DB::open(&opts, &dir)?;
+            dbs.push(Arc::new(db));
+        }
 
-        let wal_thread: Option<(Sender<()>, thread::JoinHandle<()>)> = if !write_sync {
-            let wal_db = db.clone();
+        let wal_thread: Option<(Sender<()>, thread::JoinHandle<()>)> = if manual_wal {
+            let dbs_for_wal = dbs.clone();
             let (wal_ctl, wal_rx) = channel::<()>();
-            let wal_thread = thread::Builder::new()
+            let handle = thread::Builder::new()
                 .name("rhydadb-wal-flush".to_string())
                 .spawn(move || loop {
                     match wal_rx.recv_timeout(WAL_FLUSH_INTERVAL) {
@@ -122,33 +156,51 @@ impl Storage {
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
-                    let _ = wal_db.flush_wal(true);
+                    for db in &dbs_for_wal {
+                        let _ = db.flush_wal(true);
+                    }
                 })?;
-            Some((wal_ctl, wal_thread))
+            Some((wal_ctl, handle))
         } else {
             None
         };
 
-        let shards = if write_sync {
-            let shard_count = env_num("RHYDADB_WRITE_SHARDS", cpus.clamp(1, 16), 1, 64);
-            (0..shard_count)
-                .map(|i| spawn_shard(db.clone(), i))
+        // Durable mode: one double-buffered group-commit pipeline per engine.
+        let writers = if write_sync {
+            dbs.iter()
+                .enumerate()
+                .map(|(i, db)| spawn_writer(db.clone(), i))
                 .collect()
         } else {
             Vec::new()
         };
 
         let storage = Self {
-            db,
+            dbs,
             keyspaces: RwLock::new(HashMap::new()),
             tables: RwLock::new(HashMap::new()),
             ast_cache: Mutex::new(HashMap::new()),
-            shards,
+            writers,
+            write_sync,
+            manual_wal,
             wal_ctl: wal_thread.as_ref().map(|(ctl, _)| ctl.clone()),
             wal_thread: wal_thread.map(|(_, handle)| handle),
         };
         storage.seed_system()?;
         Ok(storage)
+    }
+
+    /// Write options matching the current durability mode: the non-durable
+    /// path skips the WAL entirely (best-effort), while durable mode relies
+    /// on the per-engine fsync group commit.
+    fn write_opts(&self) -> WriteOptions {
+        let mut w = WriteOptions::default();
+        if self.write_sync {
+            w.set_sync(false); // group commit performs the fsync
+        } else {
+            w.disable_wal(true);
+        }
+        w
     }
 
     fn seed_system(&self) -> Result<()> {
@@ -431,62 +483,85 @@ impl Storage {
         Ok(())
     }
 
-    fn enqueue(&self, key: &[u8], op: impl FnOnce() -> WriteOp) -> Result<()> {
-        if self.shards.is_empty() {
+    fn engine_of(&self, routing_key: &[u8]) -> usize {
+        if self.dbs.len() <= 1 {
+            0
+        } else {
+            (fnv1a(routing_key) % self.dbs.len() as u64) as usize
+        }
+    }
+
+    /// Hash over the partition identity so every row of a partition always
+    /// lands on the same engine.
+    fn data_engine(&self, keyspace: &str, table: &str, first_part: &[u8]) -> usize {
+        let mut route = Vec::with_capacity(keyspace.len() + table.len() + first_part.len());
+        route.extend_from_slice(DT_PREFIX);
+        route.extend_from_slice(keyspace.as_bytes());
+        route.push(b'!');
+        route.extend_from_slice(table.as_bytes());
+        route.push(b'!');
+        route.extend_from_slice(first_part);
+        self.engine_of(&route)
+    }
+
+    fn enqueue(&self, engine: usize, op: WriteOp) -> Result<()> {
+        if self.writers.is_empty() {
             return Ok(());
         }
-        let idx = (fnv1a(key) % self.shards.len() as u64) as usize;
-        self.shards[idx]
-            .send(op())
+        self.writers[engine.min(self.writers.len() - 1)]
+            .send(op)
             .map_err(|_| anyhow::anyhow!("storage writer is gone"))?;
         Ok(())
     }
 
+    /// Write options for metadata/DDL: always synchronous so schema changes
+    /// are immediately visible and durable regardless of data-write mode.
+    fn meta_write_opts(&self) -> WriteOptions {
+        let mut w = WriteOptions::default();
+        if self.write_sync {
+            w.set_sync(true);
+        } else {
+            w.disable_wal(true);
+        }
+        w
+    }
+
+    /// Metadata/plain write: always engine 0.
     pub fn put(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        if self.shards.is_empty() {
-            return self
-                .db
-                .put(key, val)
-                .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"));
-        }
-        let k = key.to_vec();
-        let v = val.to_vec();
-        self.enqueue(key, move || WriteOp::Put(k, v))
+        let wopts = self.meta_write_opts();
+        self.dbs[0]
+            .put_opt(key, val, &wopts)
+            .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"))
     }
 
+    /// Metadata/plain read: engine 0.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get(key)?.map(|v| v.to_vec()))
+        Ok(self.dbs[0].get(key)?.map(|v| v.to_vec()))
     }
 
+    /// Metadata/plain delete: engine 0.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        if self.shards.is_empty() {
-            return self
-                .db
-                .delete(key)
-                .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"));
-        }
-        let k = key.to_vec();
-        self.enqueue(key, || WriteOp::Delete(k))
+        let wopts = self.meta_write_opts();
+        self.dbs[0]
+            .delete_opt(key, &wopts)
+            .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"))
     }
 
+    /// Metadata scan: engine 0 only.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
-        self.for_each_in_prefix(prefix, |k, v| {
+        self.for_each_on_engine(0, prefix, |k, v| {
             out.push((k, v));
             true
         })?;
         Ok(out)
     }
 
-    /// Streams entries under `prefix`; the callback returns false to stop
-    /// early (no further RocksDB reads are performed after that).
-    pub fn for_each_in_prefix<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    fn for_each_on_engine<F>(&self, engine: usize, prefix: &[u8], mut f: F) -> Result<()>
     where
         F: FnMut(Vec<u8>, Vec<u8>) -> bool,
     {
-        let iter = self
-            .db
-            .iterator(IteratorMode::From(prefix, Direction::Forward));
+        let iter = self.dbs[engine].iterator(IteratorMode::From(prefix, Direction::Forward));
         for item in iter {
             let (k, v) = item?;
             if !k.starts_with(prefix) {
@@ -499,13 +574,60 @@ impl Storage {
         Ok(())
     }
 
+    /// Streams entries under `prefix` on one engine; callback returns false
+    /// to stop early.
+    pub fn for_each_in_prefix<F>(&self, prefix: &[u8], f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> bool,
+    {
+        self.for_each_on_engine(0, prefix, f)
+    }
+
+    /// Streams every row of a table across all engines (unordered).
+    pub fn for_each_in_table<F>(&self, keyspace: &str, table: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> bool,
+    {
+        let prefix = self.data_prefix(keyspace, table);
+        for engine in 0..self.dbs.len() {
+            let mut stop = false;
+            self.for_each_on_engine(engine, &prefix, |k, v| {
+                stop = !f(k, v);
+                !stop
+            })?;
+            if stop {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Streams rows of one partition; the partition maps to exactly one
+    /// engine so clustering order within it is preserved.
+    pub fn for_each_in_partition<F>(
+        &self,
+        keyspace: &str,
+        table: &str,
+        partition: &[Vec<u8>],
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> bool,
+    {
+        let mut prefix = self.data_prefix(keyspace, table);
+        prefix.extend(encode_key(partition));
+        let engine = self.data_engine(keyspace, table, partition.first().map(|p| p.as_slice()).unwrap_or(&[]));
+        self.for_each_on_engine(engine, &prefix, f)
+    }
+
     pub fn delete_prefix(&self, prefix: &[u8]) -> Result<()> {
         match prefix_upper_bound(prefix) {
             Some(end) => {
+                let wopts = self.meta_write_opts();
                 let mut batch = WriteBatch::default();
                 batch.delete_range(prefix, &end);
-                self.db
-                    .write_opt(batch, &Default::default())
+                self.dbs[0]
+                    .write_opt(batch, &wopts)
                     .map_err(|e| anyhow::anyhow!("rocksdb delete_range failed: {e}"))
             }
             None => {
@@ -514,6 +636,31 @@ impl Storage {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Removes a table's data range from every engine.
+    fn delete_data_prefix(&self, data_prefix: &[u8]) -> Result<()> {
+        if let Some(end) = prefix_upper_bound(data_prefix) {
+            let wopts = self.meta_write_opts();
+            for db in &self.dbs {
+                let mut batch = WriteBatch::default();
+                batch.delete_range(data_prefix, &end);
+                db.write_opt(batch, &wopts)?;
+            }
+            Ok(())
+        } else {
+            for db in &self.dbs {
+                let iter = db.iterator(IteratorMode::From(data_prefix, Direction::Forward));
+                for item in iter {
+                    let (k, _) = item?;
+                    if !k.starts_with(data_prefix) {
+                        break;
+                    }
+                    self.delete(&k)?;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -556,8 +703,18 @@ impl Storage {
         self.delete(&ks_key)?;
         let tb_prefix = [TB_PREFIX, name.as_bytes(), b"!"].concat();
         self.delete_prefix(&tb_prefix)?;
-        let dt_prefix = [DT_PREFIX, name.as_bytes(), b"!"].concat();
-        self.delete_prefix(&dt_prefix)?;
+        // Wipe every data row of the keyspace on every engine in one range
+        // delete per engine.
+        let dt_ks_prefix = [DT_PREFIX, name.as_bytes(), b"!"].concat();
+        if let Some(end) = prefix_upper_bound(&dt_ks_prefix) {
+            let wopts = self.meta_write_opts();
+            for db in &self.dbs {
+                let mut batch = WriteBatch::default();
+                batch.delete_range(&dt_ks_prefix, &end);
+                db.write_opt(batch, &wopts)
+                    .map_err(|e| anyhow::anyhow!("rocksdb delete_range failed: {e}"))?;
+            }
+        }
         self.keyspaces
             .write()
             .expect("keyspace cache poisoned")
@@ -587,14 +744,14 @@ impl Storage {
     }
 
     pub fn get_table(&self, keyspace: &str, table: &str) -> Result<Option<Arc<TableDef>>> {
-        if let Some(def) = self
-            .tables
-            .read()
-            .expect("tables cache poisoned")
-            .get(&(keyspace.to_string(), table.to_string()))
-            .cloned()
         {
-            return Ok(Some(def));
+            let map = self.tables.read().expect("tables cache poisoned");
+            if let Some(def) = map
+                .iter()
+                .find_map(|((ks, tb), v)| (ks == keyspace && tb == table).then_some(v))
+            {
+                return Ok(Some(def.clone()));
+            }
         }
         let key = [TB_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes()].concat();
         match self.get(&key)? {
@@ -615,7 +772,7 @@ impl Storage {
         let tb_key = [TB_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes()].concat();
         self.delete(&tb_key)?;
         let dt_prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
-        self.delete_prefix(&dt_prefix)?;
+        self.delete_data_prefix(&dt_prefix)?;
         self.tables
             .write()
             .expect("tables cache poisoned")
@@ -625,7 +782,7 @@ impl Storage {
 
     pub fn truncate_table(&self, keyspace: &str, table: &str) -> Result<()> {
         let dt_prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
-        self.delete_prefix(&dt_prefix)
+        self.delete_data_prefix(&dt_prefix)
     }
 
     pub fn ast_cache_get(&self, query: &str) -> Option<Arc<CassandraStatement>> {
@@ -656,7 +813,12 @@ impl Storage {
     ) -> Result<Option<Vec<u8>>> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
-        Ok(self.get(&key)?.map(|v| v.to_vec()))
+        let engine = self.data_engine(
+            keyspace,
+            table,
+            key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
+        );
+        Ok(self.dbs[engine].get(&key)?.map(|v| v.to_vec()))
     }
 
     pub fn put_row(
@@ -668,32 +830,60 @@ impl Storage {
     ) -> Result<()> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
-        self.put(&key, value)
+        let engine = self.data_engine(
+            keyspace,
+            table,
+            key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
+        );
+        if self.writers.is_empty() {
+            let wopts = self.write_opts();
+            return self.dbs[engine]
+                .put_opt(&key, value, &wopts)
+                .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"));
+        }
+        self.enqueue(engine, WriteOp::Put(key, value.to_vec()))
     }
 
     pub fn delete_row(&self, keyspace: &str, table: &str, key_parts: &[Vec<u8>]) -> Result<()> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
-        self.delete(&key)
+        let engine = self.data_engine(
+            keyspace,
+            table,
+            key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
+        );
+        if self.writers.is_empty() {
+            let wopts = self.write_opts();
+            return self.dbs[engine]
+                .delete_opt(&key, &wopts)
+                .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"));
+        }
+        self.enqueue(engine, WriteOp::Delete(key))
     }
 
+    #[allow(dead_code)]
     pub fn scan_rows(&self, keyspace: &str, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix(&self.data_prefix(keyspace, table))
+        let mut out = Vec::new();
+        self.for_each_in_table(keyspace, table, |k, v| {
+            out.push((k, v));
+            true
+        })?;
+        Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn scan_partition(
         &self,
         keyspace: &str,
         table: &str,
         partition_key: &[Vec<u8>],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut prefix = self.data_prefix(keyspace, table);
-        prefix.extend(encode_key(partition_key));
-        self.scan_prefix(&prefix)
-    }
-
-    pub fn data_prefix_for(&self, keyspace: &str, table: &str) -> Vec<u8> {
-        self.data_prefix(keyspace, table)
+        let mut out = Vec::new();
+        self.for_each_in_partition(keyspace, table, partition_key, |k, v| {
+            out.push((k, v));
+            true
+        })?;
+        Ok(out)
     }
 }
 
@@ -719,10 +909,10 @@ fn col(name: &str, col_type: ColumnType, is_partition_key: bool) -> ColumnDef {
     }
 }
 
-/// Durable mode only: per-shard pipeline where a collector drains operations
+/// Durable mode only: per-engine pipeline where a collector drains operations
 /// into rotating buffers while a committer performs the fsync'd write. The
 /// collector never blocks on disk, so writers keep flowing ("no stop").
-fn spawn_shard(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
+fn spawn_writer(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
     let (ops_tx, ops_rx) = channel::<WriteOp>();
     let (commit_tx, commit_rx) = channel::<WriteBatch>();
 
@@ -733,13 +923,9 @@ fn spawn_shard(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
                 while let Ok(first) = ops_rx.recv() {
                     let mut batch = WriteBatch::default();
                     batch_apply(&mut batch, first);
-                    let mut n = 1usize;
-                    while n < MAX_BATCH_OPS {
+                    while batch.len() < MAX_BATCH_OPS {
                         match ops_rx.try_recv() {
-                            Ok(op) => {
-                                batch_apply(&mut batch, op);
-                                n += 1;
-                            }
+                            Ok(op) => batch_apply(&mut batch, op),
                             Err(_) => break,
                         }
                     }
@@ -754,7 +940,7 @@ fn spawn_shard(db: Arc<DB>, id: usize) -> Sender<WriteOp> {
     thread::Builder::new()
         .name(format!("rhyda-committer-{id}"))
         .spawn(move || {
-            let mut wopts = rocksdb::WriteOptions::default();
+            let mut wopts = WriteOptions::default();
             wopts.set_sync(true);
             while let Ok(batch) = commit_rx.recv() {
                 if let Err(e) = db.write_opt(batch, &wopts) {
@@ -776,9 +962,8 @@ pub fn encode_key(parts: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
-    if !full_key.starts_with(&prefix) {
+pub fn decode_key_data(prefix: &[u8], full_key: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if !full_key.starts_with(prefix) {
         return Err(anyhow::anyhow!("key does not belong to table"));
     }
     let mut rest = &full_key[prefix.len()..];
@@ -795,6 +980,11 @@ pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Ve
         rest = &rest[2 + len..];
     }
     Ok(parts)
+}
+
+pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let prefix = [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat();
+    decode_key_data(&prefix, full_key)
 }
 
 pub fn encode_row_columns(values: &[(u16, Value)]) -> Vec<u8> {

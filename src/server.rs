@@ -10,10 +10,19 @@ use scylla_cql::frame::request::{DeserializableRequest, Query, RequestOpcode, St
 use scylla_cql::frame::types;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Semaphore};
 
 const MAX_FRAME_LENGTH: usize = 64 * 1024 * 1024;
+
+/// Max concurrently executing requests per connection (protocol-level
+/// pipelining depth). Responses may be written out of order; the CQL binary
+/// protocol correlates them by stream id.
+const PER_CONN_INFLIGHT: usize = 512;
+
+/// Writer task flushes once its pending response bytes exceed this.
+const WRITE_FLUSH_THRESHOLD: usize = 256 * 1024;
 
 #[derive(Clone)]
 struct PreparedStmt {
@@ -21,12 +30,52 @@ struct PreparedStmt {
     bind_types: Vec<query::ColumnType>,
 }
 
-struct ConnState {
-    version: u8,
-    compression: Option<Compression>,
-    keyspace: Option<String>,
-    prepared: HashMap<Vec<u8>, PreparedStmt>,
-    next_prepared_id: u16,
+/// Per-connection shared state with fine-grained synchronization so the hot
+/// path (EXECUTE) never blocks: only PREPARE/STARTUP/USE touch write locks.
+struct ConnShared {
+    compression: std::sync::atomic::AtomicU8,
+    keyspace: std::sync::RwLock<Option<Arc<str>>>,
+    prepared: std::sync::RwLock<HashMap<Vec<u8>, PreparedStmt>>,
+    next_prepared_id: std::sync::atomic::AtomicU16,
+}
+
+const COMPRESSION_NONE: u8 = 0;
+
+fn decode_compression(v: u8) -> Option<Compression> {
+    match v {
+        1 => Some(Compression::Lz4),
+        2 => Some(Compression::Snappy),
+        _ => None,
+    }
+}
+
+impl ConnShared {
+    fn new() -> Self {
+        Self {
+            compression: std::sync::atomic::AtomicU8::new(COMPRESSION_NONE),
+            keyspace: std::sync::RwLock::new(None),
+            prepared: std::sync::RwLock::new(HashMap::new()),
+            next_prepared_id: std::sync::atomic::AtomicU16::new(1),
+        }
+    }
+
+    fn compression(&self) -> Option<Compression> {
+        decode_compression(self.compression.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn keyspace(&self) -> Option<Arc<str>> {
+        self.keyspace
+            .read()
+            .expect("keyspace lock poisoned")
+            .clone()
+    }
+
+    fn set_keyspace(&self, ks: &str) {
+        *self
+            .keyspace
+            .write()
+            .expect("keyspace lock poisoned") = Some(Arc::from(ks));
+    }
 }
 
 pub async fn run(listener: TcpListener, storage: Arc<Storage>) -> anyhow::Result<()> {
@@ -41,27 +90,60 @@ pub async fn run(listener: TcpListener, storage: Arc<Storage>) -> anyhow::Result
     }
 }
 
-async fn handle_connection(mut socket: TcpStream, storage: Arc<Storage>) -> anyhow::Result<()> {
-    let mut state = ConnState {
-        version: 0x04,
-        compression: None,
-        keyspace: None,
-        prepared: HashMap::new(),
-        next_prepared_id: 1,
-    };
+async fn handle_connection(socket: TcpStream, storage: Arc<Storage>) -> anyhow::Result<()> {
+    let _ = socket.set_nodelay(true);
+
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Arc<[u8]>>(PER_CONN_INFLIGHT * 2);
+    let (read_half, mut write_half) = socket.into_split();
+    let writer = tokio::spawn(async move {
+        let mut pending: Vec<Arc<[u8]>> = Vec::new();
+        let mut queued_bytes = 0usize;
+        while let Some(resp) = resp_rx.recv().await {
+            queued_bytes += resp.len();
+            pending.push(resp);
+            // Coalesce: keep draining whatever is ready right now.
+            while queued_bytes < WRITE_FLUSH_THRESHOLD {
+                match resp_rx.try_recv() {
+                    Ok(r) => {
+                        queued_bytes += r.len();
+                        pending.push(r);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let iovec: Vec<std::io::IoSlice> = pending
+                .iter()
+                .map(|p| std::io::IoSlice::new(p.as_ref()))
+                .collect();
+            if write_half.write_vectored(&iovec).await.is_err() {
+                return;
+            }
+            pending.clear();
+            queued_bytes = 0;
+        }
+    });
+
+    let _writer = writer;
+
+    let mut reader = BufReader::with_capacity(64 * 1024, read_half);
+
+    let state = Arc::new(ConnShared::new());
+    let inflight = Arc::new(Semaphore::new(PER_CONN_INFLIGHT));
+
+    let features = ProtocolFeatures::default();
 
     loop {
         let mut header = [0u8; 9];
-        match socket.read_exact(&mut header).await {
+        match reader.read_exact(&mut header).await {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
 
         let version = header[0];
         let flags = header[1];
         let stream = i16::from_be_bytes([header[2], header[3]]);
-        let opcode = header[4];
+        let opcode_raw = header[4];
         let length = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
 
         if version != 0x04 {
@@ -72,8 +154,8 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<Storage>) -> anyh
                 "Unsupported protocol version; this server supports CQL v4",
                 None,
             );
-            socket.write_all(&resp).await?;
-            return Ok(());
+            let _ = resp_tx.send(Arc::from(resp)).await;
+            break;
         }
         if length > MAX_FRAME_LENGTH {
             let resp = protocol::error(
@@ -81,17 +163,17 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<Storage>) -> anyh
                 stream,
                 0x000A,
                 "Frame too large",
-                state.compression,
+                state.compression(),
             );
-            socket.write_all(&resp).await?;
-            return Ok(());
+            let _ = resp_tx.send(Arc::from(resp)).await;
+            break;
         }
 
         let mut body = vec![0u8; length];
-        socket.read_exact(&mut body).await?;
+        reader.read_exact(&mut body).await?;
 
         let body: bytes::Bytes = if flags & 0x01 != 0 {
-            match state.compression {
+            match state.compression() {
                 Some(comp) => {
                     let decompressed = scylla_cql::frame::decompress(&body, comp)
                         .map_err(|e| anyhow!("decompression error: {e}"))?;
@@ -105,7 +187,7 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<Storage>) -> anyh
                         "Received compressed frame without negotiated compression",
                         None,
                     );
-                    socket.write_all(&resp).await?;
+                    let _ = resp_tx.send(Arc::from(resp)).await;
                     continue;
                 }
             }
@@ -113,43 +195,93 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<Storage>) -> anyh
             body.into()
         };
 
-        let resp =
-            handle_request(&storage, &mut state, opcode, &body, stream).unwrap_or_else(|e| {
-                protocol::error(version, stream, e.code, &e.message, state.compression)
-            });
-        socket.write_all(&resp).await?;
+        // Control-plane opcodes stay on the reader task: STARTUP/OPTIONS are
+        // trivially cheap, PREPARE must register before any EXECUTE of the new
+        // id can arrive, and USE must be applied before later statements on
+        // the same connection observe the session keyspace.
+        let inline = opcode_raw != RequestOpcode::Query as u8
+            && opcode_raw != RequestOpcode::Execute as u8;
+
+        if inline || is_session_use(&body) {
+            match handle_request(&storage, &state, opcode_raw, &body, stream, &features) {
+                Ok(resp) => {
+                    let _ = resp_tx.send(Arc::from(resp)).await;
+                }
+                Err(e) => {
+                    let resp =
+                        protocol::error(version, stream, e.code, &e.message, state.compression());
+                    let _ = resp_tx.send(Arc::from(resp)).await;
+                }
+            }
+            continue;
+        }
+
+        let permit = inflight.clone().acquire_owned().await?;
+        let storage = storage.clone();
+        let state = state.clone();
+        let resp_tx = resp_tx.clone();
+        tokio::spawn(async move {
+            let resp =
+                match handle_request(&storage, &state, opcode_raw, &body, stream, &features) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        protocol::error(version, stream, e.code, &e.message, state.compression())
+                    }
+                };
+            let _ = resp_tx.send(Arc::from(resp)).await;
+            drop(permit);
+        });
+    }
+    Ok(())
+}
+
+fn is_session_use(body: &[u8]) -> bool {
+    // QUERY body: <long string query> — sniff "USE " prefix cheaply.
+    if body.len() < 4 {
+        return false;
+    }
+    let len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let q = body.get(4..4 + len.min(body.len() - 4));
+    match q {
+        Some(bytes) => {
+            let t = if bytes.len() > 16 { &bytes[..16] } else { bytes };
+            let lower = t.to_ascii_lowercase();
+            lower.starts_with(b"use ")
+        }
+        None => false,
     }
 }
 
 fn handle_request(
     storage: &Storage,
-    state: &mut ConnState,
+    state: &ConnShared,
     opcode: u8,
     body: &[u8],
     stream: i16,
+    features: &ProtocolFeatures,
 ) -> Result<Vec<u8>, query::QueryError> {
-    let version = state.version;
-    let compression = state.compression;
+    use std::sync::atomic::Ordering;
+    let version = 0x04u8;
+    let compression = state.compression();
     let opcode = RequestOpcode::try_from(opcode).map_err(|_| query::QueryError {
         code: 0x000A,
         message: "Unknown opcode".to_string(),
     })?;
-    let features = ProtocolFeatures::default();
 
     match opcode {
         RequestOpcode::Options => Ok(protocol::supported(version, stream, compression)),
         RequestOpcode::Startup => {
             let mut buf: &[u8] = body;
             let startup =
-                Startup::deserialize_with_features(&mut buf, &features).map_err(|_| {
+                Startup::deserialize_with_features(&mut buf, features).map_err(|_| {
                     query::QueryError {
                         code: 0x000A,
                         message: "Malformed STARTUP message".to_string(),
                     }
                 })?;
             match startup.options.get("COMPRESSION").map(|c| c.to_lowercase()) {
-                Some(c) if c == "lz4" => state.compression = Some(Compression::Lz4),
-                Some(c) if c == "snappy" => state.compression = Some(Compression::Snappy),
+                Some(c) if c == "lz4" => state.compression.store(1, Ordering::Relaxed),
+                Some(c) if c == "snappy" => state.compression.store(2, Ordering::Relaxed),
                 Some(other) => {
                     return Err(query::QueryError {
                         code: 0x000A,
@@ -158,12 +290,12 @@ fn handle_request(
                 }
                 None => {}
             }
-            Ok(protocol::ready(version, stream, state.compression))
+            Ok(protocol::ready(version, stream, state.compression()))
         }
         RequestOpcode::Register => Ok(protocol::ready(version, stream, compression)),
         RequestOpcode::Query => {
             let mut buf: &[u8] = body;
-            let q = Query::deserialize_with_features(&mut buf, &features).map_err(|_| {
+            let q = Query::deserialize_with_features(&mut buf, features).map_err(|_| {
                 query::QueryError {
                     code: 0x000A,
                     message: "Malformed QUERY message".to_string(),
@@ -171,13 +303,19 @@ fn handle_request(
             })?;
             let query_text = q.contents.to_string();
             let values: Vec<types::RawValue> = q.parameters.values.iter().collect();
-            respond(
-                version,
-                stream,
-                state.compression,
-                query::execute_with_values(storage, &mut state.keyspace, &query_text, &values),
-                false,
-            )
+            let ks = state.keyspace();
+            let result = query::execute_with_values(
+                storage,
+                ks.as_deref(),
+                &query_text,
+                &values,
+            );
+            if let Ok(resp) = &result {
+                if let query::Response::SetKeyspace(name) = resp {
+                    state.set_keyspace(name);
+                }
+            }
+            respond(version, stream, compression, result, false)
         }
         RequestOpcode::Prepare => {
             let mut buf: &[u8] = body;
@@ -189,13 +327,20 @@ fn handle_request(
                 code: 0x2000,
                 message: e.message,
             })?;
-            let info = query::prepared_info(storage, &state.keyspace, &stmt)?;
-            let id = state.next_prepared_id.to_be_bytes().to_vec();
-            state.next_prepared_id = state.next_prepared_id.wrapping_add(1);
+            let session_ks = state.keyspace();
+            let info =
+                query::prepared_info(storage, session_ks.as_deref(), &stmt)?;
+            let id = state
+                .next_prepared_id
+                .fetch_add(1, Ordering::Relaxed)
+                .to_be_bytes()
+                .to_vec();
             let bind_types: Vec<query::ColumnType> =
                 info.bind_specs.iter().map(|(_, t)| t.clone()).collect();
             state
                 .prepared
+                .write()
+                .expect("prepared lock poisoned")
                 .insert(id.clone(), PreparedStmt { stmt, bind_types });
             Ok(protocol::result_prepared(
                 version,
@@ -206,7 +351,7 @@ fn handle_request(
                 &info.bind_specs,
                 &info.pk_indexes,
                 &info.result_cols,
-                state.compression,
+                compression,
             ))
         }
         RequestOpcode::Execute => {
@@ -215,14 +360,18 @@ fn handle_request(
                 code: 0x000A,
                 message: "Malformed EXECUTE message".to_string(),
             })?;
-            let prepared = state
-                .prepared
-                .get(id)
-                .cloned()
-                .ok_or_else(|| query::QueryError {
-                    code: 0x2200,
-                    message: "Prepared statement not found (unprepared)".to_string(),
-                })?;
+            let prepared = {
+                let map = state.prepared.read().expect("prepared lock poisoned");
+                match map.get(id) {
+                    Some(p) => p.clone(),
+                    None => {
+                        return Err(query::QueryError {
+                            code: 0x2200,
+                            message: "Prepared statement not found (unprepared)".to_string(),
+                        })
+                    }
+                }
+            };
             let params = QueryParameters::deserialize(&mut buf).map_err(|_| query::QueryError {
                 code: 0x000A,
                 message: "Malformed EXECUTE parameters".to_string(),
@@ -234,11 +383,12 @@ fn handle_request(
                     message: "Invalid amount of bind variables".to_string(),
                 });
             }
+            let ks = state.keyspace();
             respond(
                 version,
                 stream,
-                state.compression,
-                query::execute_prepared(storage, &mut state.keyspace, &prepared.stmt, &raw_values),
+                compression,
+                query::execute_prepared(storage, ks.as_deref(), &prepared.stmt, &raw_values),
                 params.skip_metadata,
             )
         }

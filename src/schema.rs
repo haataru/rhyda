@@ -162,6 +162,15 @@ pub fn norm_id(id: &Identifier) -> String {
     }
 }
 
+/// Case-sensitive for quoted identifiers, ASCII-case-insensitive for plain
+/// ones — mirrors [`norm_id`] without allocating.
+pub fn ident_eq(id: &Identifier, name: &str) -> bool {
+    match id {
+        Identifier::Quoted(s) => s == name,
+        Identifier::Unquoted(s) => s.eq_ignore_ascii_case(name),
+    }
+}
+
 pub fn build_table_def(
     keyspace: &str,
     table_name: &str,

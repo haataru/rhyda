@@ -1,6 +1,6 @@
 pub use crate::cql_value::Value;
 pub use crate::schema::ColumnType;
-use crate::schema::{KeyspaceDef, TableDef, build_table_def, norm_id};
+use crate::schema::{KeyspaceDef, TableDef, build_table_def, ident_eq, norm_id};
 use crate::storage::{Storage, decode_key, decode_row_columns, encode_row_columns};
 use cql3_parser::cassandra_ast::CassandraAST;
 use cql3_parser::cassandra_statement::CassandraStatement;
@@ -125,9 +125,11 @@ pub struct PreparedInfo {
 
 pub fn prepared_info(
     storage: &Storage,
-    session_ks: &Option<String>,
+    session_ks: Option<&str>,
     stmt: &CassandraStatement,
 ) -> Result<PreparedInfo, QueryError> {
+    let ks = session_ks.map(str::to_string);
+    let session_ks = &ks;
     match stmt {
         CassandraStatement::Insert(i) => {
             let (keyspace, table) = resolve_table(storage, session_ks, &i.table_name)?;
@@ -297,30 +299,40 @@ pub fn parse_cached(
 
 pub fn execute(
     storage: &Storage,
-    session_ks: &mut Option<String>,
+    keyspace: Option<&str>,
     query: &str,
 ) -> Result<Response, QueryError> {
     let stmt = parse_cached(storage, query)?;
-    execute_statement(storage, session_ks, &stmt, &mut Binds::none())
+    execute_statement(storage, &keyspace.map(str::to_string), &stmt, &mut Binds::none())
 }
 
 pub fn execute_with_values(
     storage: &Storage,
-    session_ks: &mut Option<String>,
+    keyspace: Option<&str>,
     query: &str,
     values: &[RawValue],
 ) -> Result<Response, QueryError> {
     let stmt = parse_cached(storage, query)?;
-    execute_statement(storage, session_ks, &stmt, &mut Binds::new(values))
+    execute_statement(
+        storage,
+        &keyspace.map(str::to_string),
+        &stmt,
+        &mut Binds::new(values),
+    )
 }
 
 pub fn execute_prepared(
     storage: &Storage,
-    session_ks: &mut Option<String>,
+    keyspace: Option<&str>,
     stmt: &CassandraStatement,
     values: &[RawValue],
 ) -> Result<Response, QueryError> {
-    execute_statement(storage, session_ks, stmt, &mut Binds::new(values))
+    execute_statement(
+        storage,
+        &keyspace.map(str::to_string),
+        stmt,
+        &mut Binds::new(values),
+    )
 }
 
 struct Binds<'a> {
@@ -356,12 +368,14 @@ impl<'a> Binds<'a> {
 
 fn execute_statement(
     storage: &Storage,
-    session_ks: &mut Option<String>,
+    session_ks: &Option<String>,
     stmt: &CassandraStatement,
     binds: &mut Binds,
 ) -> Result<Response, QueryError> {
     match stmt {
-        CassandraStatement::Use(id) => exec_use(storage, session_ks, id),
+        // Session keyspace mutation is applied by the server layer after
+        // validation succeeds; here we only validate existence.
+        CassandraStatement::Use(id) => exec_use(storage, id),
         CassandraStatement::CreateKeyspace(ks) => exec_create_keyspace(storage, ks),
         CassandraStatement::CreateTable(t) => exec_create_table(storage, session_ks, t),
         CassandraStatement::DropKeyspace(d) => exec_drop_keyspace(storage, d),
@@ -399,14 +413,12 @@ fn resolve_table(
 
 fn exec_use(
     storage: &Storage,
-    session_ks: &mut Option<String>,
     id: &cql3_parser::common::Identifier,
 ) -> Result<Response, QueryError> {
     let ks = norm_id(id);
     if storage.get_keyspace(&ks).map_err(internal_err)?.is_none() {
         return Err(invalid_err(format!("Keyspace '{ks}' does not exist")));
     }
-    *session_ks = Some(ks.clone());
     Ok(Response::SetKeyspace(ks))
 }
 
@@ -681,49 +693,48 @@ fn exec_insert(
         return Err(syntax_err("Wrong number of values provided"));
     }
 
-    let mut values: HashMap<String, Value> = HashMap::new();
+    // Resolve every provided column straight to its index: no per-request
+    // string maps or temporary names.
+    let mut resolved: Vec<Option<Value>> = vec![None; table.columns.len()];
     for (col_id, operand) in ins.columns.iter().zip(operands.iter()) {
-        let name = norm_id(col_id);
-        let col = table
-            .column(&name)
-            .ok_or_else(|| invalid_err(format!("Undefined column name {name}")))?;
-        let v = operand_to_value(operand, &col.col_type, binds)?;
-        values.insert(name, v);
+        let Some(idx) = table
+            .columns
+            .iter()
+            .position(|c| ident_eq(col_id, &c.name))
+        else {
+            return Err(invalid_err(format!(
+                "Undefined column name {}",
+                norm_id(col_id)
+            )));
+        };
+        let v = operand_to_value(operand, &table.columns[idx].col_type, binds)?;
+        resolved[idx] = Some(v);
     }
 
     let mut key_parts = Vec::new();
-    for pk in &table.partition_keys {
-        let v = values
-            .get(pk)
-            .ok_or_else(|| invalid_err(format!("Some partition key parts are missing: {pk}")))?;
+    for pk in table.partition_keys.iter().chain(table.clustering_keys.iter()) {
+        let pos = table
+            .columns
+            .iter()
+            .position(|c| &c.name == pk)
+            .ok_or_else(|| internal_err(anyhow::anyhow!("key column missing")))?;
+        let v = resolved[pos]
+            .as_ref()
+            .ok_or_else(|| invalid_err(format!("Some key parts are missing: {pk}")))?;
         if *v == Value::Null {
             return Err(invalid_err(format!(
-                "Invalid null value for partition key part {pk}"
-            )));
-        }
-        key_parts.push(v.raw_bytes());
-    }
-    for ck in &table.clustering_keys {
-        let v = values
-            .get(ck)
-            .ok_or_else(|| invalid_err(format!("Some clustering key parts are missing: {ck}")))?;
-        if *v == Value::Null {
-            return Err(invalid_err(format!(
-                "Invalid null value for clustering key part {ck}"
+                "Invalid null value for key part {pk}"
             )));
         }
         key_parts.push(v.raw_bytes());
     }
 
     let mut row_columns = Vec::new();
-    for col in &table.columns {
+    for (idx, col) in table.columns.iter().enumerate() {
         if col.is_partition_key || col.is_clustering {
             continue;
         }
-        let idx = table
-            .column_index(&col.name)
-            .ok_or_else(|| internal_err(anyhow::anyhow!("column index missing")))?;
-        let v = values.get(&col.name).cloned().unwrap_or(Value::Null);
+        let v = resolved[idx].take().unwrap_or(Value::Null);
         row_columns.push((idx as u16, v));
     }
 
@@ -813,37 +824,37 @@ fn parse_filters(
                 "Only column restrictions are supported in WHERE",
             ));
         };
-        let name = norm_id(col);
-        if table.column(&name).is_none() {
-            return Err(invalid_err(format!("Undefined column name {name}")));
-        }
+        let Some(def) = table.columns.iter().find(|c| ident_eq(col, &c.name)) else {
+            return Err(invalid_err(format!(
+                "Undefined column name {}",
+                norm_id(col)
+            )));
+        };
+        let name = def.name.clone();
         match &rel.oper {
             RelationOperator::Equal => match &rel.value {
                 Operand::Null => filters.push(Filter::Eq(name, Value::Null)),
                 Operand::Const(text) => {
-                    let col_type = table.column(&name).unwrap().col_type.clone();
-                    let v = Value::parse_literal(text, &col_type)
+                    let v = Value::parse_literal(text, &def.col_type)
                         .map_err(|e| invalid_err(e.to_string()))?;
                     filters.push(Filter::Eq(name, v));
                 }
                 Operand::Param(_) => {
-                    let col_type = table.column(&name).unwrap().col_type.clone();
-                    filters.push(Filter::Eq(name, binds.take(&col_type)?));
+                    filters.push(Filter::Eq(name, binds.take(&def.col_type)?));
                 }
                 _ => return Err(invalid_err("Only literal values are supported in WHERE")),
             },
             RelationOperator::In => {
-                let col_type = table.column(&name).unwrap().col_type.clone();
                 let mut values = Vec::new();
                 match &rel.value {
                     Operand::Tuple(items) => {
                         for item in items {
                             match item {
                                 Operand::Const(text) => values.push(
-                                    Value::parse_literal(text, &col_type)
+                                    Value::parse_literal(text, &def.col_type)
                                         .map_err(|e| invalid_err(e.to_string()))?,
                                 ),
-                                Operand::Param(_) => values.push(binds.take(&col_type)?),
+                                Operand::Param(_) => values.push(binds.take(&def.col_type)?),
                                 _ => {
                                     return Err(invalid_err(
                                         "Only literal values are supported in WHERE",
@@ -853,10 +864,10 @@ fn parse_filters(
                         }
                     }
                     Operand::Const(text) => values.push(
-                        Value::parse_literal(text, &col_type)
+                        Value::parse_literal(text, &def.col_type)
                             .map_err(|e| invalid_err(e.to_string()))?,
                     ),
-                    Operand::Param(_) => values.push(binds.take(&col_type)?),
+                    Operand::Param(_) => values.push(binds.take(&def.col_type)?),
                     _ => return Err(invalid_err("Only literal values are supported in WHERE")),
                 }
                 filters.push(Filter::In(name, values));
@@ -911,13 +922,15 @@ fn exec_select(
             .get_row(&keyspace, &table.name, &key_parts)
             .map_err(internal_err)?
         {
-            let key = [
-                storage.data_prefix_for(&keyspace, &table.name),
-                crate::storage::encode_key(&key_parts),
-            ]
-            .concat();
-            project_row(&table, &selected, &filters, &key, &bytes, &keyspace, &mut out_rows)
-                .map_err(internal_err)?;
+            project_decoded(
+                &table,
+                &selected,
+                &filters,
+                &key_parts,
+                &bytes,
+                &mut out_rows,
+            )
+            .map_err(internal_err)?;
         }
         return finish_select(keyspace, table, selected, out_rows);
     }
@@ -960,11 +973,9 @@ fn exec_select(
             partitions = next;
         }
         'parts: for partition in partitions {
-            let mut prefix = storage.data_prefix_for(&keyspace, &table.name);
-            prefix.extend(crate::storage::encode_key(&partition));
             let mut done = false;
             storage
-                .for_each_in_prefix(&prefix, |k, v| {
+                .for_each_in_partition(&keyspace, &table.name, &partition, |k, v| {
                     let cont = handle_entry(
                         &table,
                         &selected,
@@ -987,9 +998,8 @@ fn exec_select(
             }
         }
     } else {
-        let prefix = storage.data_prefix_for(&keyspace, &table.name);
         storage
-            .for_each_in_prefix(&prefix, |k, v| {
+            .for_each_in_table(&keyspace, &table.name, |k, v| {
                 handle_entry(
                     &table,
                     &selected,
@@ -1038,7 +1048,10 @@ fn handle_entry(
     out_rows: &mut Vec<Vec<Value>>,
     error_slot: &mut Option<anyhow::Error>,
 ) -> bool {
-    match project_row(table, selected, filters, &key, &value, keyspace, out_rows) {
+    let result = decode_key(keyspace, &table.name, &key).and_then(|key_parts| {
+        project_decoded(table, selected, filters, &key_parts, &value, out_rows)
+    });
+    match result {
         Ok(true) => match limit {
             Some(l) => out_rows.len() < l,
             None => true,
@@ -1055,16 +1068,14 @@ fn handle_entry(
 
 /// Decodes one stored entry into a projected output row.
 /// Returns Ok(true) when the row was emitted, Ok(false) when filtered out.
-fn project_row(
+fn project_decoded(
     table: &TableDef,
     selected: &[(String, ColumnType)],
     filters: &[Filter],
-    key: &[u8],
+    key_parts: &[Vec<u8>],
     value_bytes: &[u8],
-    keyspace: &str,
     out_rows: &mut Vec<Vec<Value>>,
 ) -> Result<bool, anyhow::Error> {
-    let key_parts = decode_key(keyspace, &table.name, key)?;
     let mut row_columns = decode_row_columns(value_bytes, table)?;
 
     let mut part_idx = 0;
