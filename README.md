@@ -1,21 +1,14 @@
 # RhydaDB
 
-**A single-node CQL database in Rust. Speaks Cassandra protocol v4. Runs on sharded RocksDB. Over a million operations per second on one machine.**
+RhydaDB is a single-node CQL database server written in Rust. It speaks the Cassandra Native Protocol v4, stores data in sharded RocksDB engines, and is designed to be fast, self-contained, and easy to run — no JVM, no cluster, no external services.
 
-```
-READ   ~1.8M ops/s      WRITE (non-durable)  ~1.0M ops/s
-MIXED  ~1.4M ops/s      WRITE (fsync durable) ~1.1M ops/s
-                        READ under Linux      ~2.3M ops/s
-```
-*20-core desktop, NVMe, pipelined prepared statements. Full methodology in [docs/04](docs/04.%20Performance%20Architecture.md).*
+RhydaDB supports keyspaces and tables with compound partition and clustering keys, prepared statements, collections (`set`, `list`, `map`), and works with standard Cassandra drivers out of the box. Under the hood: fully pipelined request execution, up to 64 independent storage engines with partition-hashed routing, micro-batched group commit with an optional fsync-durable mode, strict read-your-writes consistency, and O(1) `DROP`/`TRUNCATE` through range tombstones.
 
-## Why
+For more information on design and internals, please refer to the [documentation](docs/01.%20Server%20and%20Protocol%20Architecture.md).
 
-You want Cassandra's protocol and driver ecosystem — without JVM, clusters,
-and ops overhead. RhydaDB is a single binary that speaks native protocol v4,
-stores data durably on local disk, and is fast enough to be interesting.
+## Getting Started
 
-## Quickstart
+Build and run:
 
 ```sh
 cargo build --release
@@ -29,7 +22,7 @@ docker build -t rhydadb .
 docker run -d --name rhydadb --security-opt seccomp=unconfined -p 9042:9042 rhydadb
 ```
 
-Connect with any CQL v4 driver:
+Then connect with any CQL v4 client:
 
 ```python
 from cassandra.cluster import Cluster
@@ -40,57 +33,31 @@ s.set_keyspace("shop")
 s.execute("CREATE TABLE kv (k text PRIMARY KEY, v text)")
 
 ins = s.prepare("INSERT INTO kv (k, v) VALUES (?, ?)")
-for i in range(1000):
-    s.execute(ins, (f"k{i}", "v" * 64))
-print(s.execute("SELECT * FROM kv WHERE k = 'k7'").one())
+s.execute(ins, ("hello", "world"))
+print(s.execute("SELECT * FROM kv WHERE k = 'hello'").one())
 ```
 
-Benchmark it yourself:
+A pipelined benchmark client is included:
 
 ```sh
 ./target/release/bench_async --mode mixed --conns 128 --pipeline 256 --seconds 10
 ```
 
-## What you get
+## Documentation
 
-- **Native Protocol v4** — works with official Cassandra drivers; prepared statements, LZ4/Snappy.
-- **Pipelined server** — concurrent request execution per connection, out-of-order stream responses, zero locks on the hot path.
-- **Sharded storage engine** — up to 64 independent RocksDB instances, partition-hashed routing; writes scale past a single memtable lock.
-- **Real durability option** — double-buffered fsync group commit: ~1 fsync per batch of up to 2048 writes, strict read-your-writes preserved.
-- **O(1) DDL** — DROP/TRUNCATE via range tombstones, instant at any table size.
+- [Server and Protocol Architecture](docs/01.%20Server%20and%20Protocol%20Architecture.md)
+- [Query Engine Architecture](docs/02.%20Query%20Engine%20Architecture.md)
+- [Storage Engine Architecture](docs/03.%20Storage%20Engine%20Architecture.md)
+- [Performance Architecture](docs/04.%20Performance%20Architecture.md)
+- [API Reference](docs/05.%20API%20Reference.md)
 
-## Configuration
+## Development
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `RHYDADB_DATA` | `./data` | Data directory |
-| `RHYDADB_LISTEN` | `127.0.0.1:9042` | Bind address |
-| `RHYDADB_SYNC` | unset | Enable fsync group-commit durability |
-| `RHYDADB_ENGINE_SHARDS` | `min(cpus, 8)` | Engine count, 1–64 |
+Rust stable is required; RocksDB is compiled automatically as part of the build. Run `cargo test` to execute the integration suite — it spawns a real server and speaks raw protocol v4 end-to-end, including restart persistence checks.
 
 ## Status
 
-Alpha. Single node. No replication, no auth/TLS, no TTL/counters/BATCH/paging.
-Excellent as a dev/test Cassandra stand-in, an embedded-style high-throughput
-local store, or a base to build those features on.
-
-## Documentation
-
-- [01. Server and Protocol Architecture](docs/01.%20Server%20and%20Protocol%20Architecture.md)
-- [02. Query Engine Architecture](docs/02.%20Query%20Engine%20Architecture.md)
-- [03. Storage Engine Architecture](docs/03.%20Storage%20Engine%20Architecture.md)
-- [04. Performance Architecture](docs/04.%20Performance%20Architecture.md)
-- [05. API Reference](docs/05.%20API%20Reference.md)
-
-## Testing
-
-```sh
-cargo test
-```
-
-Integration tests spawn a real server and speak raw protocol v4: full CQL
-flow, prepared statements, concurrent hammering, garbage-frame resilience,
-restart persistence.
+Alpha software. Single node: no replication, authentication, TTL, counters, batches, or paging. See the [API Reference](docs/05.%20API%20Reference.md) for the exact supported surface.
 
 ## License
 
