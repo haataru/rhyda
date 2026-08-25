@@ -17,7 +17,12 @@ const DT_PREFIX: &[u8] = b"dt!";
 
 const AST_CACHE_CAPACITY: usize = 8192;
 
-const MAX_BATCH_OPS: usize = 1024;
+const MAX_BATCH_OPS: usize = 2048;
+
+/// Durable mode: collectors hold a freshly started batch open for this long
+/// to accumulate more ops before handing it to the fsync'ing committer.
+/// Without it, synchronized client waves produce tiny fsync-bound batches.
+const SYNC_BATCH_WINDOW: Duration = Duration::from_millis(1);
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -1030,6 +1035,7 @@ fn spawn_writer(db: Arc<DB>, id: usize, write_sync: bool) -> EngineWriter {
     let handles: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
     {
+        let batch_window = if write_sync { SYNC_BATCH_WINDOW } else { Duration::ZERO };
         let h = thread::Builder::new()
             .name(format!("rhyda-collector-{id}"))
             .spawn(move || {
@@ -1037,10 +1043,28 @@ fn spawn_writer(db: Arc<DB>, id: usize, write_sync: bool) -> EngineWriter {
                     let mut batch = WriteBatch::default();
                     let mut done: Vec<Option<DoneTx>> = Vec::new();
                     batch_apply(&mut batch, first, &mut done);
-                    while batch.len() < MAX_BATCH_OPS {
-                        match ops_rx.try_recv() {
-                            Ok(op) => batch_apply(&mut batch, op, &mut done),
-                            Err(_) => break,
+                    if batch_window.is_zero() {
+                        // Non-durable: fsync is not involved, commit whatever
+                        // is already queued right now.
+                        while batch.len() < MAX_BATCH_OPS {
+                            match ops_rx.try_recv() {
+                                Ok(op) => batch_apply(&mut batch, op, &mut done),
+                                Err(_) => break,
+                            }
+                        }
+                    } else {
+                        // Durable: hold the batch open briefly so client waves
+                        // merge into fewer, larger fsync'd writes.
+                        let start = std::time::Instant::now();
+                        while batch.len() < MAX_BATCH_OPS {
+                            let remaining = batch_window.saturating_sub(start.elapsed());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match ops_rx.recv_timeout(remaining) {
+                                Ok(op) => batch_apply(&mut batch, op, &mut done),
+                                Err(_) => break,
+                            }
                         }
                     }
                     if commit_tx.send((batch, done)).is_err() {

@@ -61,11 +61,13 @@ docker exec rhydadb bench --mode read --conns 32 --pipeline 256 --seconds 10
 
 ## Performance
 
-Pipelined CQL client (`cargo run --release --bin bench`) over prepared
-statements, single node: **~1.4M reads / ~1.4M mixed / ~875K writes (non-
-durable) and ~860K durable fsync writes per second** on a 20-core desktop;
-2.19M reads under Docker/Linux. Full methodology, tunables, architecture and
-the io_uring roadmap: [docs/04. Performance Architecture](docs/04.%20Performance%20Architecture.md).
+Pipelined CQL clients (`bench`, and `bench_async` — a tokio client with
+hundreds of async connections), single node: **~1.0M writes (non-durable),
+~1.1M durable fsync'd writes, ~1.8M reads, ~1.35M mixed** per second on a
+20-core Windows desktop; 2.27M reads under Docker/Linux. Strict
+read-your-writes is preserved via per-op commit gating. Full methodology,
+tunables, architecture and the io_uring roadmap:
+[docs/04. Performance Architecture](docs/04.%20Performance%20Architecture.md).
 
 Then connect with any CQL v4 client:
 

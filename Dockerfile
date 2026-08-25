@@ -14,7 +14,7 @@ COPY src src
 COPY tests tests
 COPY docs docs
 COPY README.md LICENSE ./
-RUN cargo build --release --bin rhydadb --bin bench
+RUN cargo build --release --bin rhydadb --bin bench --bin bench_async --bin bench
 
 # Runtime stage: minimal image with the server and the benchmark client.
 FROM ubuntu:24.04
@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/rhydadb /usr/local/bin/rhydadb
 COPY --from=build /src/target/release/bench /usr/local/bin/bench
+COPY --from=build /src/target/release/bench_async /usr/local/bin/bench_async
 ENV RHYDADB_LISTEN=0.0.0.0:9042 \
     RHYDADB_DATA=/data
 VOLUME /data
