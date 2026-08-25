@@ -9,11 +9,14 @@ RhydaDB accepts connections from any CQL v4 client (the official Python `cassand
 ## Key Features
 
 - **Native Protocol v4** — full framing, compression negotiation, typed metadata, and error codes over TCP.
+- **Fully pipelined server** — concurrent per-request execution with out-of-order stream responses, vectored coalesced writes, TCP_NODELAY, buffered IO; EXECUTE never takes a connection-level lock.
+- **Sharded storage engines** — N independent RocksDB instances (up to 64), partition-hashed routing: writes and reads scale past a single engine's memtable lock, partitions stay intact.
+- **Durable mode with double-buffered fsync group commit** — per-engine collector/committer pipelines rotate batches of up to 1024 ops so writers never wait on fsync (~1 fsync per 1024 writes).
+- **O(1) DDL** — DROP KEYSPACE / TRUNCATE use RocksDB range tombstones across all engines; schema changes are always synchronous and immediately visible.
 - **Prepared statements** — PREPARE/EXECUTE with bind metadata, partition-key positions, and skip-metadata result sets.
-- **RocksDB storage** — LZ4-compressed, durable, restart-safe; `ks!`/`tb!`/`dt!` key layout separates metadata from row data.
-- **WriteBatch group commit** — a dedicated writer thread coalesces up to 512 writes per fsync (~5x throughput in durable mode).
+- **RocksDB storage** — LZ4-compressed, durable, restart-safe; `ks!`/`tb!`/`dt!` key layout separates metadata from row data; tuned block cache, Bloom filters, parallel compaction.
 - **AST cache** — queries are parsed once per text (8192-entry bounded cache), so hot workloads skip parsing entirely.
-- **Schema cache** — keyspace/table definitions are cached in memory and invalidated on DDL.
+- **Schema cache** — keyspace/table definitions cached as `Arc`, zero-copy lookups on the hot path.
 - **Query surface** — USE, CREATE/DROP KEYSPACE, CREATE/DROP TABLE, INSERT, SELECT (`=`, `IN`, `LIMIT`), UPDATE, DELETE, TRUNCATE; types include int/bigint/smallint/tinyint, float/double, boolean, text/blob, timestamp, uuid, inet, and set/list/map collections.
 - **Compression** — LZ4 and Snappy negotiated via STARTUP.
 - **Driver-friendly system tables** — `system.local` and `system_schema` mirrors keep standard clients happy.
@@ -32,11 +35,37 @@ The tree-sitter CQL grammar is vendored under `vendor/` (a fork that accepts `?`
 RHYDADB_DATA=./data RHYDADB_LISTEN=127.0.0.1:9042 ./target/release/rhydadb
 ```
 
+> **Windows:** keep the data directory out of OneDrive/Dropbox folders and add
+> an antivirus exclusion — sync/scan overhead on SST files costs ~4x write
+> throughput (see [docs/04](docs/04.%20Performance%20Architecture.md)).
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `RHYDADB_DATA` | `./data` | RocksDB data directory |
+| `RHYDADB_DATA` | `./data` | Data directory |
 | `RHYDADB_LISTEN` | `127.0.0.1:9042` | Bind address |
-| `RHYDADB_SYNC` | unset | Durable mode: fsync per WriteBatch instead of per write |
+| `RHYDADB_SYNC` | unset | Durable mode: sharded double-buffered fsync group commit for data writes |
+| `RHYDADB_ENGINE_SHARDS` | `min(cpus, 8)` | Independent RocksDB instances, 1–64; persisted on first start |
+| `RHYDADB_CACHE_MB` | `1024` | Shared block cache size |
+| `RHYDADB_MEMTABLE_MB` | `128` | Per-engine memtable size |
+| `RHYDADB_MANUAL_WAL` | unset | Opt-in manual WAL buffering (non-durable mode) |
+
+### Docker (Ubuntu)
+
+```sh
+docker build -t rhydadb .
+# io_uring syscalls are blocked by Docker's default seccomp profile:
+docker run -d --name rhydadb --security-opt seccomp=unconfined -p 9042:9042 rhydadb
+# benchmark inside the container:
+docker exec rhydadb bench --mode read --conns 32 --pipeline 256 --seconds 10
+```
+
+## Performance
+
+Pipelined CQL client (`cargo run --release --bin bench`) over prepared
+statements, single node: **~1.4M reads / ~1.4M mixed / ~875K writes (non-
+durable) and ~860K durable fsync writes per second** on a 20-core desktop;
+2.19M reads under Docker/Linux. Full methodology, tunables, architecture and
+the io_uring roadmap: [docs/04. Performance Architecture](docs/04.%20Performance%20Architecture.md).
 
 Then connect with any CQL v4 client:
 
