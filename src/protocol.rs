@@ -153,16 +153,33 @@ pub fn result_rows(
     cols: &[(String, ColumnType)],
     rows: &[Vec<Value>],
     skip_metadata: bool,
+    paging_state: Option<&[u8]>,
     compression: Option<Compression>,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&0x0002i32.to_be_bytes());
+    let has_more = paging_state.is_some();
     if skip_metadata {
-        body.extend_from_slice(&0x0000i32.to_be_bytes());
+        let mut flags = 0i32;
+        if has_more {
+            flags |= 0x0002;
+        }
+        // Keep legacy behavior: no_metadata is signaled by col_count=-1 alone, flags stays 0/2 (not 0x0004)
+        body.extend_from_slice(&flags.to_be_bytes());
         body.extend_from_slice(&(-1i32).to_be_bytes());
+        if let Some(ps) = paging_state {
+            types::write_bytes(ps, &mut body).expect("paging_state serialization");
+        }
     } else {
-        body.extend_from_slice(&0x0001i32.to_be_bytes());
+        let mut flags: i32 = 0x0001; // global_tables_spec
+        if has_more {
+            flags |= 0x0002;
+        }
+        body.extend_from_slice(&flags.to_be_bytes());
         body.extend_from_slice(&(cols.len() as i32).to_be_bytes());
+        if let Some(ps) = paging_state {
+            types::write_bytes(ps, &mut body).expect("paging_state serialization");
+        }
         types::write_string(keyspace, &mut body).expect("metadata serialization");
         types::write_string(table, &mut body).expect("metadata serialization");
         for (name, ty) in cols {

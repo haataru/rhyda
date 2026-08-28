@@ -1,4 +1,5 @@
 pub mod cql_value;
+pub mod health;
 pub mod protocol;
 pub mod query;
 pub mod schema;

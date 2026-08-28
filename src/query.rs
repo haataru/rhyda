@@ -108,6 +108,8 @@ pub enum Response {
         table: String,
         cols: Vec<(String, ColumnType)>,
         rows: Vec<Vec<Value>>,
+        // Paging: if Some, client should use it as `paging_state` for next page
+        paging_state: Option<Vec<u8>>,
     },
     Void,
     SetKeyspace(String),
@@ -315,6 +317,8 @@ pub fn execute(
         &stmt,
         &mut Binds::none(),
         &mut gates,
+        None,
+        None,
     )?;
     Ok((resp, gates))
 }
@@ -333,6 +337,30 @@ pub fn execute_with_values(
         &stmt,
         &mut Binds::new(values),
         &mut gates,
+        None,
+        None,
+    )?;
+    Ok((resp, gates))
+}
+
+pub fn execute_with_values_paged(
+    storage: &Storage,
+    keyspace: Option<&str>,
+    query: &str,
+    values: &[RawValue],
+    page_size: Option<i32>,
+    paging_state: Option<Vec<u8>>,
+) -> Result<(Response, Vec<WriteTicket>), QueryError> {
+    let stmt = parse_cached(storage, query)?;
+    let mut gates = Vec::new();
+    let resp = execute_statement(
+        storage,
+        &keyspace.map(str::to_string),
+        &stmt,
+        &mut Binds::new(values),
+        &mut gates,
+        page_size,
+        paging_state,
     )?;
     Ok((resp, gates))
 }
@@ -350,6 +378,29 @@ pub fn execute_prepared(
         stmt,
         &mut Binds::new(values),
         &mut gates,
+        None,
+        None,
+    )?;
+    Ok((resp, gates))
+}
+
+pub fn execute_prepared_paged(
+    storage: &Storage,
+    keyspace: Option<&str>,
+    stmt: &CassandraStatement,
+    values: &[RawValue],
+    page_size: Option<i32>,
+    paging_state: Option<Vec<u8>>,
+) -> Result<(Response, Vec<WriteTicket>), QueryError> {
+    let mut gates = Vec::new();
+    let resp = execute_statement(
+        storage,
+        &keyspace.map(str::to_string),
+        stmt,
+        &mut Binds::new(values),
+        &mut gates,
+        page_size,
+        paging_state,
     )?;
     Ok((resp, gates))
 }
@@ -391,6 +442,8 @@ fn execute_statement(
     stmt: &CassandraStatement,
     binds: &mut Binds,
     gates: &mut Vec<WriteTicket>,
+    page_size: Option<i32>,
+    paging_state: Option<Vec<u8>>,
 ) -> Result<Response, QueryError> {
     match stmt {
         // Session keyspace mutation is applied by the server layer after
@@ -401,7 +454,9 @@ fn execute_statement(
         CassandraStatement::DropKeyspace(d) => exec_drop_keyspace(storage, d, gates),
         CassandraStatement::DropTable(d) => exec_drop_table(storage, session_ks, d, gates),
         CassandraStatement::Insert(i) => exec_insert(storage, session_ks, i, binds, gates),
-        CassandraStatement::Select(s) => exec_select(storage, session_ks, s, binds),
+        CassandraStatement::Select(s) => {
+            exec_select(storage, session_ks, s, binds, page_size, paging_state)
+        }
         CassandraStatement::Delete(d) => exec_delete(storage, session_ks, d, binds, gates),
         CassandraStatement::Update(u) => exec_update(storage, session_ks, u, binds, gates),
         CassandraStatement::Truncate(name) => {
@@ -915,6 +970,8 @@ fn exec_select(
     session_ks: &Option<String>,
     sel: &cql3_parser::select::Select,
     binds: &mut Binds,
+    page_size: Option<i32>,
+    paging_state: Option<Vec<u8>>,
 ) -> Result<Response, QueryError> {
     let (keyspace, table) = resolve_table(storage, session_ks, &sel.table_name)?;
 
@@ -923,7 +980,23 @@ fn exec_select(
     let filters = parse_filters(&table, &sel.where_clause, binds)?;
 
     let limit: Option<usize> = sel.limit.map(|l| l as usize);
+    // Paging: page_size from QueryParameters (client), paging_state is opaque full DB key
+    let page_size_usize = page_size.map(|ps| ps as usize);
+    let effective_page_limit: Option<usize> = match (page_size_usize, limit) {
+        (Some(ps), Some(l)) => Some(ps.min(l)),
+        (Some(ps), None) => Some(ps),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
+    };
+    // Hard cap to prevent OOM when no paging nor limit and large scan
+    let hard_cap = 5000usize;
+    let (page_limit, use_hard_cap) = match effective_page_limit {
+        Some(l) => (Some(l), false),
+        None => (Some(hard_cap), true),
+    };
+    // For point lookup we don't want hard cap, so we will not use it there
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut paging_last_key: Option<Vec<u8>> = None;
 
     // Pre-compute column indexes for the hot per-row path to avoid O(columns)
     // linear searches inside `project_decoded` (called for every row scanned).
@@ -1002,10 +1075,13 @@ fn exec_select(
                 .map_err(internal_err)?;
             }
         }
-        return finish_select(keyspace, table, selected, out_rows);
+        return finish_select(keyspace, table, selected, out_rows, None);
     }
 
+    // For scans, page_limit is effective paging limit (page_size or limit or hard cap)
+    // and paging_state is opaque full DB key to resume after.
     let mut error_slot: Option<anyhow::Error> = None;
+    let paging_bytes = paging_state.clone();
 
     let mut pk_restricted = true;
     for pk in &table.partition_keys {
@@ -1044,8 +1120,22 @@ fn exec_select(
         }
         'parts: for partition in partitions {
             let mut done = false;
+            let paging_clone = paging_bytes.clone();
+            let page_limit_clone = page_limit;
             storage
                 .for_each_in_partition(&keyspace, &table.name, &partition, |k, v| {
+                    if let Some(ps) = &paging_clone {
+                        if k <= *ps {
+                            return true;
+                        }
+                    }
+                    if let Some(pl) = page_limit_clone {
+                        if out_rows.len() >= pl {
+                            paging_last_key = Some(k.clone());
+                            done = true;
+                            return false;
+                        }
+                    }
                     let cont = handle_entry(
                         &table,
                         &selected_idxs,
@@ -1053,12 +1143,23 @@ fn exec_select(
                         &in_filters,
                         &key_col_idxs,
                         &keyspace,
-                        limit,
-                        k,
+                        page_limit,
+                        k.clone(),
                         v,
                         &mut out_rows,
                         &mut error_slot,
                     );
+                    if cont {
+                        if let Some(pl) = page_limit {
+                            if out_rows.len() >= pl {
+                                paging_last_key = Some(k.clone());
+                                done = true;
+                                return false;
+                            }
+                        }
+                    } else {
+                        done = true;
+                    }
                     if !cont {
                         done = true;
                     }
@@ -1068,23 +1169,50 @@ fn exec_select(
             if done || error_slot.is_some() {
                 break 'parts;
             }
+            if let Some(pl) = page_limit {
+                if out_rows.len() >= pl {
+                    break 'parts;
+                }
+            }
         }
     } else {
+        let paging_clone = paging_bytes.clone();
+        let page_limit_clone = page_limit;
         storage
             .for_each_in_table(&keyspace, &table.name, |k, v| {
-                handle_entry(
+                if let Some(ps) = &paging_clone {
+                    if k <= *ps {
+                        return true;
+                    }
+                }
+                if let Some(pl) = page_limit_clone {
+                    if out_rows.len() >= pl {
+                        paging_last_key = Some(k.clone());
+                        return false;
+                    }
+                }
+                let cont = handle_entry(
                     &table,
                     &selected_idxs,
                     &eq_filters,
                     &in_filters,
                     &key_col_idxs,
                     &keyspace,
-                    limit,
-                    k,
+                    page_limit,
+                    k.clone(),
                     v,
                     &mut out_rows,
                     &mut error_slot,
-                )
+                );
+                if cont {
+                    if let Some(pl) = page_limit {
+                        if out_rows.len() >= pl {
+                            paging_last_key = Some(k.clone());
+                            return false;
+                        }
+                    }
+                }
+                cont
             })
             .map_err(internal_err)?;
     }
@@ -1093,7 +1221,20 @@ fn exec_select(
         return Err(internal_err(e));
     }
 
-    finish_select(keyspace, table, selected, out_rows)
+    let has_more = if let Some(_pl) = effective_page_limit {
+        // Explicit paging/limit: has_more if we hit page_size (not limit)
+        if let Some(ps) = page_size {
+            out_rows.len() >= ps as usize && paging_last_key.is_some()
+        } else {
+            false
+        }
+    } else if use_hard_cap {
+        out_rows.len() >= hard_cap && paging_last_key.is_some()
+    } else {
+        false
+    };
+    let next_paging_state = if has_more { paging_last_key } else { None };
+    finish_select(keyspace, table, selected, out_rows, next_paging_state)
 }
 
 fn finish_select(
@@ -1101,12 +1242,14 @@ fn finish_select(
     table: Arc<TableDef>,
     selected: Vec<(String, ColumnType)>,
     rows: Vec<Vec<Value>>,
+    paging_state: Option<Vec<u8>>,
 ) -> Result<Response, QueryError> {
     Ok(Response::Rows {
         keyspace,
         table: table.name.clone(),
         cols: selected,
         rows,
+        paging_state,
     })
 }
 

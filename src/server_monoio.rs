@@ -363,12 +363,25 @@ async fn handle_request(
             let query_text = q.contents.to_string();
             let values: Vec<types::RawValue> = q.parameters.values.iter().collect();
             let ks = state.keyspace();
-            let result = query::execute_with_values(storage, ks.as_deref(), &query_text, &values);
+            let page_size = q.parameters.page_size;
+            let paging_state = q
+                .parameters
+                .paging_state
+                .as_bytes_slice()
+                .map(|b| b.to_vec());
+            let result = query::execute_with_values_paged(
+                storage,
+                ks.as_deref(),
+                &query_text,
+                &values,
+                page_size,
+                paging_state,
+            );
             let response = settle_then(storage, result, |resp| {
                 if let query::Response::SetKeyspace(ref name) = resp {
                     state.set_keyspace(name);
                 }
-                respond(version, stream, compression, Ok(resp), false)
+                respond(version, stream, compression, Ok(resp), q.parameters.skip_metadata)
                     .unwrap_or_else(|e| protocol::error(version, stream, e.code, &e.message, compression))
             })
             .await;
@@ -441,7 +454,19 @@ async fn handle_request(
                 });
             }
             let ks = state.keyspace();
-            let result = query::execute_prepared(storage, ks.as_deref(), &prepared.stmt, &raw_values);
+            let page_size = params.page_size;
+            let paging_state = params
+                .paging_state
+                .as_bytes_slice()
+                .map(|b| b.to_vec());
+            let result = query::execute_prepared_paged(
+                storage,
+                ks.as_deref(),
+                &prepared.stmt,
+                &raw_values,
+                page_size,
+                paging_state,
+            );
             settle_then(storage, result, |resp| {
                 respond(version, stream, compression, Ok(resp), params.skip_metadata)
                     .unwrap_or_else(|e| protocol::error(version, stream, e.code, &e.message, compression))
@@ -473,6 +498,7 @@ fn respond(
             table,
             cols,
             rows,
+            paging_state,
         }) => Ok(protocol::result_rows(
             version,
             stream,
@@ -481,6 +507,7 @@ fn respond(
             &cols,
             &rows,
             skip_metadata,
+            paging_state.as_deref(),
             compression,
         )),
         Ok(query::Response::Void) => Ok(protocol::result_void(version, stream, compression)),

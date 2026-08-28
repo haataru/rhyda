@@ -18,12 +18,28 @@ fn main() -> anyhow::Result<()> {
     let listen = std::env::var("RHYDADB_LISTEN").unwrap_or_else(|_| "127.0.0.1:9042".to_string());
 
     let storage = Arc::new(Storage::open(&data_dir)?);
+    let health_listen = std::env::var("RHYDADB_HEALTH_LISTEN").unwrap_or_else(|_| {
+        if std::env::var("RHYDADB_URING").is_ok() {
+            "0.0.0.0:8080".to_string()
+        } else {
+            "127.0.0.1:8080".to_string()
+        }
+    });
 
     // Thread-per-core io_uring path: RHYDADB_URING=1 + --features uring on Linux
     if std::env::var("RHYDADB_URING").is_ok() {
         #[cfg(all(feature = "uring", target_os = "linux"))]
         {
-            tracing::info!("starting monoio thread-per-core server on {listen}");
+            tracing::info!("starting monoio thread-per-core server on {listen} with health {health_listen}");
+            // Health still on tokio runtime in a separate OS thread to avoid mixing runtimes
+            let hl = health_listen.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(rhydadb::health::run(hl));
+            });
             return rhydadb::server_monoio::run_blocking(storage, listen);
         }
         #[cfg(not(all(feature = "uring", target_os = "linux")))]
@@ -37,8 +53,10 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
+        let hl = health_listen.clone();
+        tokio::spawn(rhydadb::health::run(hl));
         let listener = tokio::net::TcpListener::bind(&listen).await?;
-        tracing::info!("RhydaDB listening on {listen}, data dir: {data_dir}");
+        tracing::info!("RhydaDB listening on {listen}, data dir: {data_dir}, health {health_listen}");
         rhydadb::server::run(listener, storage).await
     })
 }
