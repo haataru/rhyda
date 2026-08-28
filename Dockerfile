@@ -1,7 +1,7 @@
 # Build stage: compile rhydadb against bundled RocksDB on Ubuntu.
 FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl build-essential clang libclang-dev make pkg-config git \
+        ca-certificates curl build-essential clang libclang-dev make pkg-config git liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -14,7 +14,7 @@ COPY src src
 COPY tests tests
 COPY docs docs
 COPY README.md LICENSE ./
-RUN cargo build --release --bin rhydadb --bin bench --bin bench_async --bin bench
+RUN cargo build --release --features uring --bin rhydadb --bin bench --bin bench_async || cargo build --release --bin rhydadb --bin bench --bin bench_async
 
 # Runtime stage: minimal image with the server and the benchmark client.
 FROM ubuntu:24.04

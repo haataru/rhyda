@@ -5,20 +5,27 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+async-channel = "2.5"
 bytes = "1.12.1"
 cql3-parser = "0.4.2"
-hex = "0.4.3"
 dashmap = "6.1"
+hex = "0.4.3"
 mimalloc = "0.1.44"
+monoio = { version = "0.2", features = ["iouring", "sync"], optional = true }
 rocksdb = "0.24.0"
 scylla-cql = "1.8.0"
 serde = "1.0.229"
 serde_json = "1.0.151"
+socket2 = { version = "0.5", optional = true }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.1", features = ["v4"] }
+
+[features]
+default = []
+uring = ["monoio", "socket2"]
 
 # Vendored fork of tree-sitter-cql: adds bind marker ('?') support in
 # UPDATE assignment values (upstream grammar only allows literals).
