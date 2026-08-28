@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use rhydadb::server;
 use rhydadb::storage::Storage;
 use std::sync::Arc;

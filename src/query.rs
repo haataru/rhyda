@@ -925,6 +925,27 @@ fn exec_select(
     let limit: Option<usize> = sel.limit.map(|l| l as usize);
     let mut out_rows: Vec<Vec<Value>> = Vec::new();
 
+    // Pre-compute column indexes for the hot per-row path to avoid O(columns)
+    // linear searches inside `project_decoded` (called for every row scanned).
+    let selected_idxs: Vec<usize> = selected
+        .iter()
+        .map(|(name, _)| table.column_index(name).unwrap())
+        .collect();
+    let mut eq_filters: Vec<(usize, Value)> = Vec::new();
+    let mut in_filters: Vec<(usize, Vec<Value>)> = Vec::new();
+    for f in &filters {
+        match f {
+            Filter::Eq(name, v) => eq_filters.push((table.column_index(name).unwrap(), v.clone())),
+            Filter::In(name, vs) => in_filters.push((table.column_index(name).unwrap(), vs.clone())),
+        }
+    }
+    let key_col_idxs: Vec<usize> = table
+        .partition_keys
+        .iter()
+        .chain(table.clustering_keys.iter())
+        .map(|name| table.column_index(name).unwrap())
+        .collect();
+
     // Fastest path: every partition-key AND clustering-key part is restricted
     // by '=' — the row address is fully known, use a direct point lookup.
     let point_key: Option<Vec<Vec<u8>>> = {
@@ -952,8 +973,10 @@ fn exec_select(
         {
             project_decoded(
                 &table,
-                &selected,
-                &filters,
+                &selected_idxs,
+                &eq_filters,
+                &in_filters,
+                &key_col_idxs,
                 &key_parts,
                 &bytes,
                 &mut out_rows,
@@ -1006,8 +1029,10 @@ fn exec_select(
                 .for_each_in_partition(&keyspace, &table.name, &partition, |k, v| {
                     let cont = handle_entry(
                         &table,
-                        &selected,
-                        &filters,
+                        &selected_idxs,
+                        &eq_filters,
+                        &in_filters,
+                        &key_col_idxs,
                         &keyspace,
                         limit,
                         k,
@@ -1030,8 +1055,10 @@ fn exec_select(
             .for_each_in_table(&keyspace, &table.name, |k, v| {
                 handle_entry(
                     &table,
-                    &selected,
-                    &filters,
+                    &selected_idxs,
+                    &eq_filters,
+                    &in_filters,
+                    &key_col_idxs,
                     &keyspace,
                     limit,
                     k,
@@ -1067,8 +1094,10 @@ fn finish_select(
 #[allow(clippy::too_many_arguments)]
 fn handle_entry(
     table: &TableDef,
-    selected: &[(String, ColumnType)],
-    filters: &[Filter],
+    selected_idxs: &[usize],
+    eq_filters: &[(usize, Value)],
+    in_filters: &[(usize, Vec<Value>)],
+    key_col_idxs: &[usize],
     keyspace: &str,
     limit: Option<usize>,
     key: Vec<u8>,
@@ -1077,7 +1106,16 @@ fn handle_entry(
     error_slot: &mut Option<anyhow::Error>,
 ) -> bool {
     let result = decode_key(keyspace, &table.name, &key).and_then(|key_parts| {
-        project_decoded(table, selected, filters, &key_parts, &value, out_rows)
+        project_decoded(
+            table,
+            selected_idxs,
+            eq_filters,
+            in_filters,
+            key_col_idxs,
+            &key_parts,
+            &value,
+            out_rows,
+        )
     });
     match result {
         Ok(true) => match limit {
@@ -1098,46 +1136,36 @@ fn handle_entry(
 /// Returns Ok(true) when the row was emitted, Ok(false) when filtered out.
 fn project_decoded(
     table: &TableDef,
-    selected: &[(String, ColumnType)],
-    filters: &[Filter],
+    selected_idxs: &[usize],
+    eq_filters: &[(usize, Value)],
+    in_filters: &[(usize, Vec<Value>)],
+    key_col_idxs: &[usize],
     key_parts: &[Vec<u8>],
     value_bytes: &[u8],
     out_rows: &mut Vec<Vec<Value>>,
 ) -> Result<bool, anyhow::Error> {
     let mut row_columns = decode_row_columns(value_bytes, table)?;
 
-    let mut part_idx = 0;
-    for col in &table.columns {
-        if col.is_partition_key || col.is_clustering {
-            if part_idx < key_parts.len() {
-                let idx = table.column_index(&col.name).unwrap();
-                row_columns[idx] =
-                    Value::from_raw_bytes(&key_parts[part_idx], &col.col_type)?;
-            }
-            part_idx += 1;
+    for (part_idx, &col_idx) in key_col_idxs.iter().enumerate() {
+        if part_idx < key_parts.len() {
+            row_columns[col_idx] =
+                Value::from_raw_bytes(&key_parts[part_idx], &table.columns[col_idx].col_type)?;
         }
     }
 
-    for f in filters {
-        let (name, expected) = match f {
-            Filter::Eq(name, v) => (&name[..], v),
-            Filter::In(name, vs) => {
-                let idx = table.column_index(&name[..]).unwrap();
-                match vs.iter().find(|v| **v == row_columns[idx]) {
-                    Some(v) => (&name[..], v),
-                    None => return Ok(false),
-                }
-            }
-        };
-        let idx = table.column_index(name).unwrap();
-        if *expected != row_columns[idx] {
+    for (idx, expected) in eq_filters {
+        if *expected != row_columns[*idx] {
+            return Ok(false);
+        }
+    }
+    for (idx, vs) in in_filters {
+        if vs.iter().find(|v| **v == row_columns[*idx]).is_none() {
             return Ok(false);
         }
     }
 
-    let mut out = Vec::with_capacity(selected.len());
-    for (name, _) in selected {
-        let idx = table.column_index(name).unwrap();
+    let mut out = Vec::with_capacity(selected_idxs.len());
+    for &idx in selected_idxs {
         out.push(row_columns[idx].clone());
     }
     out_rows.push(out);

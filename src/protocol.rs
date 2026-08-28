@@ -171,9 +171,12 @@ pub fn result_rows(
         }
     }
     body.extend_from_slice(&(rows.len() as i32).to_be_bytes());
+    // Pre-reserve: estimate 16 bytes per value + payload to avoid reallocs on large rows.
+    let est: usize = rows.iter().map(|r| r.len() * 16).sum();
+    body.reserve(est);
     for row in rows {
         for v in row {
-            body.extend(v.to_wire());
+            v.write_wire(&mut body);
         }
     }
     response_frame(version, stream, ResponseOpcode::Result, &body, compression)

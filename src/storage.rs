@@ -151,7 +151,7 @@ impl Storage {
             Err(_) => {
                 let n = env_num(
                     "RHYDADB_ENGINE_SHARDS",
-                    cpus.clamp(2, 8).min(8),
+                    cpus.clamp(4, 16),
                     1,
                     64,
                 );
@@ -174,6 +174,7 @@ impl Storage {
         // of serializing every write on one critical section.
         opts.set_allow_concurrent_memtable_write(true);
         opts.set_enable_write_thread_adaptive_yield(true);
+        opts.set_enable_pipelined_write(true);
 
         let mut bb_opts = rocksdb::BlockBasedOptions::default();
         let cache = rocksdb::Cache::new_lru_cache(cache_mb * 1024 * 1024);
@@ -1138,10 +1139,11 @@ pub fn decode_key(keyspace: &str, table: &str, full_key: &[u8]) -> Result<Vec<Ve
 }
 
 pub fn encode_row_columns(values: &[(u16, Value)]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Estimate ~ 24 bytes per column to reduce reallocs.
+    let mut out = Vec::with_capacity(values.len() * 32);
     for (idx, v) in values {
         out.extend_from_slice(&idx.to_be_bytes());
-        out.extend(v.to_wire());
+        v.write_wire(&mut out);
     }
     out
 }

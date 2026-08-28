@@ -22,18 +22,98 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn to_wire(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// Zero-copy wire encoding directly into `out` (no intermediate Vec allocation).
+    pub fn write_wire(&self, out: &mut Vec<u8>) {
         match self {
-            Value::Null => {
-                out.extend_from_slice(&(-1i32).to_be_bytes());
+            Value::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Value::Int(v) => {
+                out.extend_from_slice(&4i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
             }
-            v => {
-                let raw = v.raw_bytes();
-                out.extend_from_slice(&(raw.len() as i32).to_be_bytes());
-                out.extend_from_slice(&raw);
+            Value::BigInt(v) => {
+                out.extend_from_slice(&8i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::SmallInt(v) => {
+                out.extend_from_slice(&2i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::TinyInt(v) => {
+                out.extend_from_slice(&1i32.to_be_bytes());
+                out.push(*v as u8);
+            }
+            Value::Float(v) => {
+                out.extend_from_slice(&4i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Double(v) => {
+                out.extend_from_slice(&8i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Boolean(v) => {
+                out.extend_from_slice(&1i32.to_be_bytes());
+                out.push(*v as u8);
+            }
+            Value::Text(v) => {
+                out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                out.extend_from_slice(v.as_bytes());
+            }
+            Value::Blob(v) => {
+                out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                out.extend_from_slice(v);
+            }
+            Value::Timestamp(v) => {
+                out.extend_from_slice(&8i32.to_be_bytes());
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Uuid(v) => {
+                out.extend_from_slice(&16i32.to_be_bytes());
+                out.extend_from_slice(v);
+            }
+            Value::Inet(v) => match v {
+                std::net::IpAddr::V4(a) => {
+                    out.extend_from_slice(&4i32.to_be_bytes());
+                    out.extend_from_slice(&a.octets());
+                }
+                std::net::IpAddr::V6(a) => {
+                    out.extend_from_slice(&16i32.to_be_bytes());
+                    out.extend_from_slice(&a.octets());
+                }
+            },
+            Value::Set(values) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&(values.len() as i32).to_be_bytes());
+                for e in values {
+                    e.write_wire(&mut payload);
+                }
+                out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+                out.extend_from_slice(&payload);
+            }
+            Value::List(values) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&(values.len() as i32).to_be_bytes());
+                for e in values {
+                    e.write_wire(&mut payload);
+                }
+                out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+                out.extend_from_slice(&payload);
+            }
+            Value::Map(entries) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&(entries.len() as i32).to_be_bytes());
+                for (k, v) in entries {
+                    k.write_wire(&mut payload);
+                    v.write_wire(&mut payload);
+                }
+                out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+                out.extend_from_slice(&payload);
             }
         }
+    }
+
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_wire(&mut out);
         out
     }
 
