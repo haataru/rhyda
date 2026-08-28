@@ -72,6 +72,10 @@ pub struct Storage {
     write_sync: bool,
     wal_ctl: Option<Sender<()>>,
     wal_thread: Option<thread::JoinHandle<()>>,
+    /// Point-lookup row cache (phase 2): caches raw RocksDB values keyed by
+    /// full `dt!` key. Opt-out with `RHYDADB_ROW_CACHE_ENTRIES=0`.
+    /// Backed by lock-free DashMap (sharded), shared across all engines/threads.
+    row_cache: Option<dashmap::DashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl Drop for Storage {
@@ -228,6 +232,17 @@ impl Storage {
             .map(|(i, db)| spawn_writer(db.clone(), i, write_sync))
             .collect();
 
+        // Phase 2 row cache: only for user data, not for system keyspaces.
+        // Tuned for point reads (bench: 200k-1M keys). Disable with 0.
+        // DashMap is lock-free for reads; we enforce a soft capacity via
+        // `RHYDADB_ROW_CACHE_ENTRIES` (evict random entry when overfull).
+        let row_cache_entries = env_num("RHYDADB_ROW_CACHE_ENTRIES", 500_000, 0, 10_000_000);
+        let row_cache = if row_cache_entries == 0 {
+            None
+        } else {
+            Some(dashmap::DashMap::new())
+        };
+
         let storage = Self {
             dbs,
             keyspaces: RwLock::new(HashMap::new()),
@@ -237,6 +252,7 @@ impl Storage {
             write_sync,
             wal_ctl: wal_thread.as_ref().map(|(ctl, _)| ctl.clone()),
             wal_thread: wal_thread.map(|(_, handle)| handle),
+            row_cache,
         };
         storage.seed_system()?;
         Ok(storage)
@@ -704,6 +720,13 @@ impl Storage {
                 }
             }
         }
+        // Range tombstone for user data: invalidate cache (rare, clear all to
+        // avoid per-key prefix scans).
+        if let Some(cache) = &self.row_cache {
+            if data_prefix.starts_with(DT_PREFIX) {
+                cache.clear();
+            }
+        }
         Ok(tickets)
     }
 
@@ -844,6 +867,11 @@ impl Storage {
         [DT_PREFIX, keyspace.as_bytes(), b"!", table.as_bytes(), b"!"].concat()
     }
 
+    #[inline]
+    fn should_cache(keyspace: &str) -> bool {
+        keyspace != "system" && keyspace != "system_schema"
+    }
+
     pub fn get_row(
         &self,
         keyspace: &str,
@@ -852,12 +880,25 @@ impl Storage {
     ) -> Result<Option<Vec<u8>>> {
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
+        if Self::should_cache(keyspace) {
+            if let Some(cache) = &self.row_cache {
+                if let Some(v) = cache.get(&key) {
+                    return Ok(Some(v.value().clone()));
+                }
+            }
+        }
         let engine = self.data_engine(
             keyspace,
             table,
             key_parts.first().map(|p| p.as_slice()).unwrap_or(&[]),
         );
-        Ok(self.dbs[engine].get(&key)?.map(|v| v.to_vec()))
+        let res = self.dbs[engine].get(&key)?.map(|v| v.to_vec());
+        if Self::should_cache(keyspace) {
+            if let (Some(cache), Some(v)) = (&self.row_cache, &res) {
+                cache.insert(key, v.clone());
+            }
+        }
+        Ok(res)
     }
 
     /// Synchronous row write used only by DDL schema mirrors and seeding:
@@ -879,7 +920,13 @@ impl Storage {
         let wopts = self.meta_write_opts();
         self.dbs[engine]
             .put_opt(&key, value, &wopts)
-            .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("rocksdb put failed: {e}"))?;
+        if Self::should_cache(keyspace) {
+            if let Some(cache) = &self.row_cache {
+                cache.insert(key, value.to_vec());
+            }
+        }
+        Ok(())
     }
 
     /// Synchronous row delete for DDL schema mirrors.
@@ -899,7 +946,13 @@ impl Storage {
         let wopts = self.meta_write_opts();
         self.dbs[engine]
             .delete_opt(&key, &wopts)
-            .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("rocksdb delete failed: {e}"))?;
+        if Self::should_cache(keyspace) {
+            if let Some(cache) = &self.row_cache {
+                cache.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     /// Asynchronous micro-batched row write. Returns a ticket the caller must
@@ -911,6 +964,13 @@ impl Storage {
         key_parts: &[Vec<u8>],
         value: &[u8],
     ) -> Result<WriteTicket> {
+        if Self::should_cache(keyspace) {
+            if let Some(cache) = &self.row_cache {
+                let mut cache_key = self.data_prefix(keyspace, table);
+                cache_key.extend(encode_key(key_parts));
+                cache.insert(cache_key, value.to_vec());
+            }
+        }
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
         self.write_data_op(
@@ -932,6 +992,13 @@ impl Storage {
         table: &str,
         key_parts: &[Vec<u8>],
     ) -> Result<WriteTicket> {
+        if Self::should_cache(keyspace) {
+            if let Some(cache) = &self.row_cache {
+                let mut cache_key = self.data_prefix(keyspace, table);
+                cache_key.extend(encode_key(key_parts));
+                cache.remove(&cache_key);
+            }
+        }
         let mut key = self.data_prefix(keyspace, table);
         key.extend(encode_key(key_parts));
         self.write_data_op(

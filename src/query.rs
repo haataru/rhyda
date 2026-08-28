@@ -971,17 +971,36 @@ fn exec_select(
             .get_row(&keyspace, &table.name, &key_parts)
             .map_err(internal_err)?
         {
-            project_decoded(
-                &table,
-                &selected_idxs,
-                &eq_filters,
-                &in_filters,
-                &key_col_idxs,
-                &key_parts,
-                &bytes,
-                &mut out_rows,
-            )
-            .map_err(internal_err)?;
+            // Fast path for single-partition-key point lookup with only PK EQ
+            // (bench.kv / OLTP pattern): avoids full row decode + filter re-check.
+            let fast = in_filters.is_empty()
+                && eq_filters.len() == key_col_idxs.len()
+                && table.clustering_keys.is_empty()
+                && table.partition_keys.len() == 1
+                && eq_filters.iter().all(|(idx, _)| key_col_idxs.contains(idx));
+            if fast {
+                project_fast_point(
+                    &table,
+                    &selected_idxs,
+                    &key_col_idxs,
+                    &key_parts,
+                    &bytes,
+                    &mut out_rows,
+                )
+                .map_err(internal_err)?;
+            } else {
+                project_decoded(
+                    &table,
+                    &selected_idxs,
+                    &eq_filters,
+                    &in_filters,
+                    &key_col_idxs,
+                    &key_parts,
+                    &bytes,
+                    &mut out_rows,
+                )
+                .map_err(internal_err)?;
+            }
         }
         return finish_select(keyspace, table, selected, out_rows);
     }
@@ -1130,6 +1149,65 @@ fn handle_entry(
             false
         }
     }
+}
+
+/// Fast path for single-PK point lookup: directly builds output row without
+/// allocating full `row_columns` vector or re-checking PK filters.
+fn project_fast_point(
+    table: &TableDef,
+    selected_idxs: &[usize],
+    key_col_idxs: &[usize],
+    key_parts: &[Vec<u8>],
+    value_bytes: &[u8],
+    out_rows: &mut Vec<Vec<Value>>,
+) -> Result<bool, anyhow::Error> {
+    let mut out = Vec::with_capacity(selected_idxs.len());
+    for &idx in selected_idxs {
+        if let Some(pos) = key_col_idxs.iter().position(|&k| k == idx) {
+            out.push(Value::from_raw_bytes(
+                &key_parts[pos],
+                &table.columns[idx].col_type,
+            )?);
+        } else {
+            // Scan sparse value for this column index
+            let mut off = 0usize;
+            let mut found: Option<Value> = None;
+            while off < value_bytes.len() {
+                if off + 2 > value_bytes.len() {
+                    return Err(anyhow::anyhow!("corrupt row value"));
+                }
+                let c_idx = u16::from_be_bytes([value_bytes[off], value_bytes[off + 1]]) as usize;
+                off += 2;
+                if off + 4 > value_bytes.len() {
+                    return Err(anyhow::anyhow!("corrupt row value"));
+                }
+                let len = i32::from_be_bytes([
+                    value_bytes[off],
+                    value_bytes[off + 1],
+                    value_bytes[off + 2],
+                    value_bytes[off + 3],
+                ]);
+                off += 4;
+                if c_idx == idx {
+                    if len == -1 {
+                        found = Some(Value::Null);
+                    } else {
+                        if off + len as usize > value_bytes.len() {
+                            return Err(anyhow::anyhow!("corrupt row value"));
+                        }
+                        let raw = &value_bytes[off..off + len as usize];
+                        found = Some(Value::from_raw_bytes(raw, &table.columns[idx].col_type)?);
+                    }
+                    break;
+                } else if len != -1 {
+                    off += len as usize;
+                }
+            }
+            out.push(found.unwrap_or(Value::Null));
+        }
+    }
+    out_rows.push(out);
+    Ok(true)
 }
 
 /// Decodes one stored entry into a projected output row.
