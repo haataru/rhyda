@@ -259,13 +259,12 @@ impl Storage {
     }
 
     fn seed_system(&self) -> Result<()> {
-        if self.get_keyspace("system")?.is_some() {
-            return Ok(());
-        }
-        self.put_keyspace(&KeyspaceDef {
-            name: "system".to_string(),
-            replication: vec![],
-        })?;
+        let system_exists = self.get_keyspace("system")?.is_some();
+        if !system_exists {
+            self.put_keyspace(&KeyspaceDef {
+                name: "system".to_string(),
+                replication: vec![],
+            })?;
 
         let local_def = TableDef {
             keyspace: "system".to_string(),
@@ -345,8 +344,10 @@ impl Storage {
             clustering_keys: vec![],
         };
         self.put_table(&peers_def)?;
+        }
 
-        let text2 = ColumnType::Text;
+        if self.get_keyspace("system_schema")?.is_none() {
+            let text2 = ColumnType::Text;
         let set_text = ColumnType::Set(Box::new(text2.clone()));
         let list_text = ColumnType::List(Box::new(text2.clone()));
         let map_tt = ColumnType::Map(Box::new(text2.clone()), Box::new(text2.clone()));
@@ -534,6 +535,27 @@ impl Storage {
         })?;
         for def in sys_schema_defs {
             self.put_table(&def)?;
+        }
+        }
+        // system_virtual_schema is queried by DataStax Java driver (cassandra-stress) for
+        // `system_virtual_schema.keyspaces`. Provide an empty stub so the driver can bootstrap.
+        if self.get_keyspace("system_virtual_schema")?.is_none() {
+            self.put_keyspace(&KeyspaceDef {
+                name: "system_virtual_schema".to_string(),
+                replication: vec![],
+            })?;
+            let vs_keyspaces = TableDef {
+                keyspace: "system_virtual_schema".to_string(),
+                name: "keyspaces".to_string(),
+                columns: vec![
+                    col("keyspace_name", ColumnType::Text, true),
+                    col("durable_writes", ColumnType::Boolean, false),
+                    col("replication", ColumnType::Map(Box::new(ColumnType::Text), Box::new(ColumnType::Text)), false),
+                ],
+                partition_keys: vec!["keyspace_name".to_string()],
+                clustering_keys: vec![],
+            };
+            self.put_table(&vs_keyspaces)?;
         }
         Ok(())
     }
@@ -869,7 +891,9 @@ impl Storage {
 
     #[inline]
     fn should_cache(keyspace: &str) -> bool {
-        keyspace != "system" && keyspace != "system_schema"
+        keyspace != "system"
+            && keyspace != "system_schema"
+            && keyspace != "system_virtual_schema"
     }
 
     pub fn get_row(

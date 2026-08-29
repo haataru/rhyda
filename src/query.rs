@@ -53,7 +53,7 @@ fn internal_err(e: anyhow::Error) -> QueryError {
     }
 }
 
-const SYSTEM_KEYSPACES: [&str; 2] = ["system", "system_schema"];
+const SYSTEM_KEYSPACES: [&str; 3] = ["system", "system_schema", "system_virtual_schema"];
 
 fn check_writable(keyspace: &str) -> Result<(), QueryError> {
     if SYSTEM_KEYSPACES.contains(&keyspace) {
@@ -973,6 +973,41 @@ fn exec_select(
     page_size: Option<i32>,
     paging_state: Option<Vec<u8>>,
 ) -> Result<Response, QueryError> {
+    // system_virtual_schema is virtual - return empty for any missing table so DataStax driver (cassandra-stress) can bootstrap
+    if let Some(ks) = &sel.table_name.keyspace {
+        if norm_id(ks) == "system_virtual_schema" {
+            let tname = norm_id(&sel.table_name.name);
+            if storage
+                .get_table("system_virtual_schema", &tname)
+                .map_err(internal_err)?
+                .is_none()
+            {
+                return Ok(Response::Rows {
+                    keyspace: "system_virtual_schema".to_string(),
+                    table: tname,
+                    cols: vec![],
+                    rows: vec![],
+                    paging_state: None,
+                });
+            }
+        }
+    } else if let Some(ks) = session_ks {
+        if ks == "system_virtual_schema"
+            && storage
+                .get_table("system_virtual_schema", &norm_id(&sel.table_name.name))
+                .map_err(internal_err)?
+                .is_none()
+        {
+            let tname = norm_id(&sel.table_name.name);
+            return Ok(Response::Rows {
+                keyspace: "system_virtual_schema".to_string(),
+                table: tname,
+                cols: vec![],
+                rows: vec![],
+                paging_state: None,
+            });
+        }
+    }
     let (keyspace, table) = resolve_table(storage, session_ks, &sel.table_name)?;
 
     let selected = select_columns(&table, &sel.columns)?;
